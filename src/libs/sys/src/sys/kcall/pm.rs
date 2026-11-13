@@ -1,0 +1,1224 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use crate::{
+    error::{
+        Error,
+        ErrorCode,
+    },
+    kcall0,
+    kcall1,
+    kcall2,
+    kcall3,
+    kcall4,
+    mm::VirtualAddress,
+    number::KcallNumber,
+    pm::{
+        Capability,
+        ConditionAddress,
+        ExecvArgs,
+        MutexAddress,
+        ProcessIdentifier,
+        SigAction,
+        SigSet,
+        ThreadCreateArgs,
+        ThreadIdentifier,
+    },
+    time::SystemTime,
+};
+use ::core::{
+    hint::unlikely,
+    sync::atomic::{
+        AtomicI32,
+        Ordering,
+    },
+    time::Duration,
+};
+
+//==================================================================================================
+// Get Process Identifier
+//==================================================================================================
+
+/// Sentinel stored in [`CACHED_PID`] meaning "not yet cached". Every valid process identifier is
+/// non-negative, so a negative value can never be mistaken for a real pid.
+const PID_UNCACHED: i32 = -1;
+
+/// Process-global cache of the calling process's identifier.
+///
+/// `getpid()` is invariant for the lifetime of a process and identical across all of its threads
+/// (the kernel resolves it per process, not per thread), so it can be memoized to avoid a kernel
+/// transition on every query. The cache lives in the process address space and is therefore
+/// duplicated into a child by `fork()`; the child half of `__kcall_fork()` invalidates it (see
+/// [`invalidate_cached_pid`]) so the child re-queries its own identity rather than reusing the
+/// parent's.
+///
+/// The cache is a single, per-process-image instance. A C-linked guest image links several
+/// independently-compiled static archives (e.g. `libposix.a` and `libnvx_crt0.a`), each embedding
+/// its own compilation of this crate; without a shared symbol every archive would carry a private
+/// `CACHED_PID`, and a `fork()` invalidation in one archive would not refresh the copy another
+/// archive reads (it could still serve the parent's pid inherited through copy-on-write memory).
+/// Giving the storage a stable export name with `weak` linkage collapses those per-archive copies
+/// into one instance at link time, so a single invalidation reliably refreshes every reader. The
+/// `weak` linkage lets the duplicate definitions merge instead of colliding, and is harmless for a
+/// single-compilation Rust binary, where only one definition exists.
+#[unsafe(export_name = "__nanvix_sys_cached_pid")]
+#[linkage = "weak"]
+static CACHED_PID: AtomicI32 = AtomicI32::new(PID_UNCACHED);
+
+///
+/// # Description
+///
+/// Issues the raw `getpid()` kernel call, bypassing the cache.
+///
+/// This is the private primitive shared by the public [`getpid`] (cached) and [`getpid_uncached`]
+/// (uncached) wrappers. It always incurs a kernel transition.
+///
+/// # Returns
+///
+/// Upon successful completion, the process identifier of the calling process is returned. Upon
+/// failure, an error is returned instead.
+///
+fn __kcall_getpid() -> Result<ProcessIdentifier, Error> {
+    let result: i64 = kcall0!(KcallNumber::GetPid.into());
+
+    // NOTE: errors are unlikely because getpid() always succeeds for a valid calling process.
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to getpid()"))
+    } else {
+        ProcessIdentifier::try_from(result)
+    }
+}
+
+///
+/// # Description
+///
+/// Gets the process identifier of the calling process, serving a memoized value when available.
+///
+/// The kernel is queried only on the first call per process image; subsequent calls return the
+/// cached value without a kernel transition. The cache is invalidated by the child half of
+/// `fork()`, so the returned identifier always reflects the *current* process even after a fork.
+/// This is the preferred way to obtain the calling process's identifier.
+///
+/// # Returns
+///
+/// Upon successful completion, the process identifier of the calling process is returned. Upon
+/// failure, an error is returned instead.
+///
+pub fn getpid() -> Result<ProcessIdentifier, Error> {
+    // Fast path: return the memoized identifier without a kernel transition.
+    let cached: i32 = CACHED_PID.load(Ordering::Relaxed);
+    if cached != PID_UNCACHED {
+        return Ok(ProcessIdentifier::from(cached));
+    }
+
+    // Cold path: query the kernel once and memoize the result. Concurrent threads of the same
+    // process all resolve to the same identifier, so a benign race that stores it twice is
+    // harmless.
+    let pid: ProcessIdentifier = __kcall_getpid()?;
+    CACHED_PID.store(pid.into(), Ordering::Relaxed);
+    Ok(pid)
+}
+
+///
+/// # Description
+///
+/// Gets the process identifier of the calling process by always querying the kernel, bypassing the
+/// cache.
+///
+/// Prefer [`getpid`] in production code. This uncached variant exists for low-level callers that
+/// must observe the kernel's current identity directly — most notably code that creates children
+/// through the raw `__kcall_duplicate()` primitive, which does not pass through the cache
+/// invalidation performed by the child half of `__kcall_fork()` and therefore cannot rely on the
+/// cached value being fresh in the child.
+///
+/// # Returns
+///
+/// Upon successful completion, the process identifier of the calling process is returned. Upon
+/// failure, an error is returned instead.
+///
+pub fn getpid_uncached() -> Result<ProcessIdentifier, Error> {
+    __kcall_getpid()
+}
+
+///
+/// # Description
+///
+/// Invalidates the cached process identifier so that the next [`getpid`] call re-queries the
+/// kernel.
+///
+/// The child half of `__kcall_fork()` invokes this automatically. Callers that create a child
+/// through the raw `__kcall_duplicate()` primitive instead — which has no in-child choke point —
+/// must invoke it themselves as the child's first action; otherwise the child inherits the parent's
+/// cached identifier through the duplicated address space and would issue kernel calls under the
+/// parent's identity. A process's identifier is otherwise stable for its whole lifetime, so no
+/// other caller needs this.
+///
+pub fn invalidate_cached_pid() {
+    CACHED_PID.store(PID_UNCACHED, Ordering::Relaxed);
+}
+
+//==================================================================================================
+// Get Parent Process Identifier
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets the process identifier of the parent of the calling process.
+///
+/// # Returns
+///
+/// Upon successful completion, the process identifier of the parent of the calling process is
+/// returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_getppid() -> Result<ProcessIdentifier, Error> {
+    let result: i64 = kcall0!(KcallNumber::GetPpid.into());
+
+    // NOTE: errors are unlikely because getppid() always succeeds for a valid calling process.
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to getppid()"))
+    } else {
+        ProcessIdentifier::try_from(result)
+    }
+}
+
+//==================================================================================================
+// Get Thread Identifier
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets the thread identifier of the calling thread.
+///
+/// # Returns
+///
+/// Upon successful completion, the thread identifier of the calling thread is returned. Upon
+/// failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_gettid() -> Result<ThreadIdentifier, Error> {
+    let result: i64 = kcall0!(KcallNumber::GetTid.into());
+
+    // NOTE: errors are unlikely because gettid() always succeeds for a valid calling thread.
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to gettid()"))
+    } else {
+        ThreadIdentifier::try_from(result)
+    }
+}
+
+//==================================================================================================
+// Exit
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Exits the calling process.
+///
+/// # Parameters
+///
+/// - `status`: Exit status.
+///
+/// # Returns
+///
+/// Upon successful completion, this function does not return. Upon failure, an error is returned
+/// instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_exit(status: i32) -> Result<!, Error> {
+    let result: i64 = kcall1!(KcallNumber::Exit.into(), status as u32);
+    Err(Error::new(ErrorCode::try_from(result)?, "failed to terminate process"))
+}
+
+//==================================================================================================
+// Capability Control
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Controls a capability for the calling process.
+///
+/// # Parameters
+///
+/// - `capability`: Capability to control.
+/// - `value`: Whether to enable or disable the capability.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_capctl(capability: Capability, value: bool) -> Result<(), Error> {
+    let result: i64 = kcall2!(KcallNumber::CapCtl.into(), capability as u32, value as u32);
+
+    // NOTE: errors are unlikely because capability control typically succeeds.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to capctl()"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Terminate
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Terminates a target process.
+///
+/// # Parameters
+///
+/// - `pid`: Process identifier of the process to terminate.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_terminate(pid: ProcessIdentifier) -> Result<(), Error> {
+    let result: i64 = kcall1!(KcallNumber::Terminate.into(), u32::try_from(pid)?);
+
+    // NOTE: errors are unlikely because terminate typically succeeds for a valid process.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to terminate()"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Kill
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Posts a signal to a target process.
+///
+/// This is the privileged in-kernel posting primitive. A process may always post to itself; posting
+/// to another process requires the [`Capability::ProcessManagement`] capability, so unprivileged
+/// cross-process signaling is expected to be routed through the process-manager daemon. A `signum`
+/// of zero performs only the permission and existence check without posting any signal.
+///
+/// # Parameters
+///
+/// - `pid`: Process identifier of the target process.
+/// - `signum`: Signal number to post, or zero to perform only the existence check.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_kill(pid: ProcessIdentifier, signum: i32) -> Result<(), Error> {
+    let result: i64 = kcall2!(KcallNumber::Kill.into(), u32::try_from(pid)?, signum as u32);
+
+    if result < 0 {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to kill()"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Sigaction
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets and/or sets the disposition of a signal for the calling process.
+///
+/// # Parameters
+///
+/// - `signum`: Signal number.
+/// - `act`: Pointer to the new action, or null to leave the disposition unchanged.
+/// - `oldact`: Pointer that receives the previous action, or null if not wanted.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+/// # Safety
+///
+/// This function is unsafe because the caller must ensure that `act` and `oldact` are either null
+/// or valid, properly aligned pointers to [`SigAction`] values.
+///
+pub unsafe fn __kcall_sigaction(
+    signum: i32,
+    act: *const SigAction,
+    oldact: *mut SigAction,
+) -> Result<(), Error> {
+    let result: i64 = kcall3!(
+        KcallNumber::Sigaction.into(),
+        signum as u32,
+        act as usize as u32,
+        oldact as usize as u32
+    );
+
+    if result < 0 {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to sigaction()"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Sigprocmask
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets and/or modifies the blocked-signal mask of the calling thread.
+///
+/// # Parameters
+///
+/// - `how`: How to combine `set` with the current mask (`SIG_BLOCK`, `SIG_UNBLOCK`, or
+///   `SIG_SETMASK`); ignored when `set` is null.
+/// - `set`: Pointer to the signals to apply, or null to leave the mask unchanged.
+/// - `oldset`: Pointer that receives the previous mask, or null if not wanted.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+/// # Safety
+///
+/// This function is unsafe because the caller must ensure that `set` and `oldset` are either null
+/// or valid, properly aligned pointers to [`SigSet`] values.
+///
+pub unsafe fn __kcall_sigprocmask(
+    how: i32,
+    set: *const SigSet,
+    oldset: *mut SigSet,
+) -> Result<(), Error> {
+    let result: i64 = kcall3!(
+        KcallNumber::Sigprocmask.into(),
+        how as u32,
+        set as usize as u32,
+        oldset as usize as u32
+    );
+
+    if result < 0 {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to sigprocmask()"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Sigpending
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Retrieves the set of signals that are pending on the calling process but blocked from delivery
+/// to the calling thread.
+///
+/// # Parameters
+///
+/// - `set`: User-space pointer that receives the pending-but-blocked signal set.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+/// # Safety
+///
+/// This function is unsafe because the caller must ensure that `set` is a valid, properly aligned
+/// pointer to a [`SigSet`] value.
+///
+pub unsafe fn __kcall_sigpending(set: *mut SigSet) -> Result<(), Error> {
+    // The kernel call carries the address in a single 32-bit register, so reject a pointer that does
+    // not fit rather than silently truncating it (which could forward a wrong address on a 64-bit
+    // image whose buffer sits above 4 GiB).
+    let set_raw: u32 = u32::try_from(set as usize).map_err(|_| {
+        Error::new(ErrorCode::InvalidArgument, "signal set address exceeds u32::MAX")
+    })?;
+
+    let result: i64 = kcall1!(KcallNumber::Sigpending.into(), set_raw);
+
+    if result < 0 {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to sigpending()"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Sigsuspend
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Atomically installs `mask` as the calling thread's blocked-signal mask and suspends the thread
+/// until a caught signal is delivered, after which the previous mask is restored.
+///
+/// Following POSIX, `sigsuspend()` always returns an error; on the expected path it is
+/// [`ErrorCode::Interrupted`] (`EINTR`).
+///
+/// # Parameters
+///
+/// - `mask`: User-space pointer to the temporary mask to install while suspended.
+///
+/// # Returns
+///
+/// Always returns an error: [`ErrorCode::Interrupted`] once a signal is caught, or another error
+/// code on failure.
+///
+/// # Safety
+///
+/// This function is unsafe because the caller must ensure that `mask` is a valid, properly aligned
+/// pointer to a [`SigSet`] value.
+///
+pub unsafe fn __kcall_sigsuspend(mask: *const SigSet) -> Result<(), Error> {
+    // The kernel call carries the address in a single 32-bit register, so reject a pointer that does
+    // not fit rather than silently truncating it (which could forward a wrong address on a 64-bit
+    // image whose buffer sits above 4 GiB).
+    let mask_raw: u32 = u32::try_from(mask as usize).map_err(|_| {
+        Error::new(ErrorCode::InvalidArgument, "signal mask address exceeds u32::MAX")
+    })?;
+
+    let result: i64 = kcall1!(KcallNumber::Sigsuspend.into(), mask_raw);
+
+    if result < 0 {
+        Err(Error::new(ErrorCode::try_from(result)?, "sigsuspend() interrupted"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Sig Restorer
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Registers the calling process's user-space signal-return trampoline (restorer).
+///
+/// The kernel records `restorer` and installs it as the return address of every caught-signal
+/// handler frame it builds, so that a handler returns into the trampoline, which issues
+/// `sigreturn()`. Each freshly loaded image re-registers its restorer after `execv()`.
+///
+/// # Parameters
+///
+/// - `restorer`: Address of the restorer trampoline in the calling process's address space.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+pub fn __kcall_sig_restorer(restorer: usize) -> Result<(), Error> {
+    // The kernel call carries the address in a single 32-bit register, so reject a restorer that
+    // does not fit rather than silently truncating it (which could register a wrong address, or even
+    // pass kernel validation, on a 64-bit image whose trampoline sits above 4 GiB).
+    let restorer_raw: u32 = u32::try_from(restorer)
+        .map_err(|_| Error::new(ErrorCode::InvalidArgument, "restorer address exceeds u32::MAX"))?;
+
+    let result: i64 = kcall1!(KcallNumber::SigRestorer.into(), restorer_raw);
+
+    if result < 0 {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to register signal restorer"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Create Thread
+//==================================================================================================
+
+#[cfg(target_arch = "x86")]
+::core::arch::global_asm!(
+    r#"
+    .global _do_start_thread
+    .extern _do_exit_thread
+
+    _do_start_thread:
+        #
+        # Entry point for newly created threads.
+        #
+        # The kernel sets up a trap frame so that IRET "returns" to this function.
+        # The kernel passes the thread function pointer in EDX and its argument
+        # in ECX.
+        #
+        # This stub calls func(arg) and then _do_exit_thread(status) directly,
+        # enforcing 16-byte stack alignment before each CALL instruction. This
+        # avoids routing through a Rust intermediate function whose compiler-
+        # generated prologue may not preserve 16-byte alignment (the Nanvix Rust
+        # target disables SSE, so LLVM omits alignment-preserving prologues).
+        # The callee func may require 16-byte-aligned stack frames (e.g.,
+        # movaps) when SSE instructions are present.
+        #
+
+        # Save func and arg into callee-saved registers.
+        # This is the thread root frame so there is no caller state to preserve.
+        mov esi, edx        # ESI = func
+        mov edi, ecx        # EDI = arg
+
+        # Set up frame pointer and force 16-byte alignment.
+        and esp, -16
+        mov ebp, esp
+
+        #
+        # Call func(arg).
+        #
+        # Stack alignment arithmetic (i386 SysV ABI):
+        #   and esp,-16 -> ESP = 0 (mod 16)   (force-aligned)
+        #   sub esp, 12 -> ESP = 4 (mod 16)   (alignment padding)
+        #   push edi    -> ESP = 0 (mod 16)   (push arg)
+        #   call esi    -> ESP = 12 (mod 16)  (return address pushed by CALL)
+        #
+        sub esp, 12
+        push edi
+        call esi
+
+        #
+        # Call _do_exit_thread(status).
+        #
+        # func() returned status in EAX.  Re-align the stack for the next call.
+        #
+        # Stack alignment arithmetic:
+        #   and esp,-16 -> ESP = 0 (mod 16)   (force-aligned)
+        #   sub esp, 12 -> ESP = 4 (mod 16)   (alignment padding)
+        #   push eax    -> ESP = 0 (mod 16)   (push status)
+        #   call        -> ESP = 12 (mod 16)  (return address pushed by CALL)
+        #
+        and esp, -16
+        sub esp, 12
+        push eax
+        call _do_exit_thread
+
+    # Safety net: _do_exit_thread() calls exit_thread() and never returns.
+    # If it somehow does, spin forever rather than falling through.
+    1: jmp 1b
+    "#
+);
+
+#[cfg(target_arch = "x86_64")]
+::core::arch::global_asm!(
+    r#"
+    .global _do_start_thread
+    .extern _do_exit_thread
+
+    _do_start_thread:
+        #
+        # Entry point for newly created threads.
+        #
+        # The kernel enters user mode with the forged argument registers already set up, mirroring
+        # the SysV delivery used for the main process entry: RDI = arg0 (the user thread function)
+        # and RSI = arg1 (its argument). No arguments are placed on the user stack. This stub calls
+        # func(arg) and then _do_exit_thread(status) directly, enforcing 16-byte stack alignment
+        # before each CALL instruction.
+        #
+        mov rax, rdi        # RAX = func (arg0)
+        mov rdi, rsi        # RDI = arg (arg1) -> first SysV argument to func
+        and rsp, -16
+        call rax
+
+        # func() returned status in EAX -> first argument (EDI) of _do_exit_thread.
+        and rsp, -16
+        mov edi, eax
+        call _do_exit_thread
+
+    # Safety net: _do_exit_thread() never returns. Spin if it ever does.
+    1: jmp 1b
+    "#
+);
+
+#[cfg(target_os = "none")]
+::core::arch::global_asm!(".type _do_start_thread, @function");
+
+///
+/// # Description
+///
+/// Exit handler for newly created threads. Called by the `_do_start_thread` assembly stub when the
+/// thread function returns. Invokes [`exit_thread()`] with the thread's return status.
+///
+/// # Parameters
+///
+/// - `status`: Exit status returned by the thread function.
+///
+#[unsafe(no_mangle)]
+pub extern "C" fn _do_exit_thread(status: usize) -> ! {
+    let _ = __kcall_exit_thread(status);
+    unreachable!("failed to exit thread");
+}
+
+///
+/// # Description
+///
+/// Creates a new thread in the calling process.
+///
+/// # Parameters
+///
+/// - `args`: Mutable reference to thread creation arguments, including the entry point and
+///   stack configuration. The `user_fn` field is overwritten with the internal thread entry stub.
+///
+/// # Returns
+///
+/// Upon successful completion, the thread identifier of the new thread is returned. Upon failure,
+/// an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_create_thread(args: &mut ThreadCreateArgs) -> Result<ThreadIdentifier, Error> {
+    unsafe extern "C" {
+        fn _do_start_thread() -> !;
+    }
+
+    // Check if the user function is set.
+    if args.user_fn != ThreadCreateArgs::NULL_USER_FN {
+        // If the user function is already set, it means that this function has been called
+        // recursively, which is not allowed.
+        return Err(Error::new(ErrorCode::InvalidArgument, "user function is set"));
+    }
+
+    args.user_fn = VirtualAddress::from_raw_value(_do_start_thread as *const () as usize);
+
+    let result: i64 =
+        kcall1!(KcallNumber::CreateThread.into(), args as *const ThreadCreateArgs as usize as u32);
+
+    // NOTE: errors may happen on resource exhaustion, but are still unlikely in general.
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to create_thread()"))
+    } else {
+        ThreadIdentifier::try_from(result)
+    }
+}
+
+//==================================================================================================
+// Exit Thread
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Exits the calling thread.
+///
+/// # Parameters
+///
+/// - `status`: Exit status of the thread.
+///
+/// # Returns
+///
+/// Upon successful completion, this function does not return. Upon failure, an error is returned
+/// instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_exit_thread(status: usize) -> Result<!, Error> {
+    let tid: ThreadIdentifier = __kcall_gettid()?;
+    let blocked: SigSet = !0;
+    let mut previous: SigSet = 0;
+    unsafe {
+        __kcall_sigprocmask(crate::pm::SIG_SETMASK, &blocked, &mut previous)?;
+    }
+    // Dropping the response stash may enter the allocator. Keep signals blocked so allocator
+    // cleanup cannot deliver a handler that recreates request state for this departing thread.
+    crate::ipc::clear_request_state(tid);
+    let result: i64 = kcall1!(KcallNumber::ExitThread.into(), status as u32);
+
+    unsafe {
+        __kcall_sigprocmask(crate::pm::SIG_SETMASK, &previous, core::ptr::null_mut())?;
+    }
+    Err(Error::new(ErrorCode::try_from(result)?, "failed to terminate thread"))
+}
+
+//==================================================================================================
+// Join Thread
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Waits for a target thread to terminate and retrieves its exit status.
+///
+/// # Parameters
+///
+/// - `tid`: Thread identifier of the thread to join.
+/// - `retval`: Mutable reference to store the exit status of the joined thread.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_join_thread(tid: ThreadIdentifier, retval: &mut usize) -> Result<(), Error> {
+    let result: i64 =
+        kcall2!(KcallNumber::JoinThread.into(), i32::from(tid) as u32, retval as *mut usize as u32);
+
+    // NOTE: errors are unlikely because join typically succeeds for a valid thread.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to join thread"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Detach Thread
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Detaches a thread. A detached thread is automatically harvested when it exits, without requiring
+/// another thread to join it.
+///
+/// # Parameters
+///
+/// - `tid`: Thread identifier of the thread to detach.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_detach_thread(tid: ThreadIdentifier) -> Result<(), Error> {
+    let result: i64 = kcall1!(KcallNumber::DetachThread.into(), i32::from(tid) as u32);
+
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to detach thread"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Duplicate
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Duplicates the calling process. The child process is created with a clone of the caller's
+/// address space, and its main thread starts executing at the entry point described by `args`
+/// on the user-supplied stack.
+///
+/// The operation is refused when the calling process owns any "special" resources, namely
+/// allocated memory-mapped I/O regions, port-mapped I/O ports, event ownerships, or buffered
+/// in-flight mailbox messages.
+///
+/// # Parameters
+///
+/// - `args`: Thread creation arguments describing the child's main thread entry point and stack.
+///
+/// # Returns
+///
+/// Upon successful completion, the process identifier of the new child process is returned.
+/// Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_duplicate(args: &ThreadCreateArgs) -> Result<ProcessIdentifier, Error> {
+    let result: i64 =
+        kcall1!(KcallNumber::Duplicate.into(), args as *const ThreadCreateArgs as usize as u32);
+
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to duplicate process"))
+    } else {
+        ProcessIdentifier::try_from(result)
+    }
+}
+
+//==================================================================================================
+// Execv
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Replaces the image of the calling process with a new program, following POSIX `execv()`
+/// semantics. The kernel performs no filesystem I/O: the caller must have already loaded the raw
+/// ELF image into its own address space, and `args` describes that image together with the
+/// argument and environment strings to install for the new image.
+///
+/// On success the calling process's address space and main thread are replaced and control
+/// transfers to the entry point of the new image, so this call does not return. It returns only
+/// when the image could not be replaced, in which case the calling process is left intact.
+///
+/// # Parameters
+///
+/// - `args`: Description of the ELF image to load and the argument and environment strings.
+///
+/// # Returns
+///
+/// This function returns only on failure, yielding the error reported by the kernel.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_execv(args: &ExecvArgs) -> Error {
+    let result: i64 = kcall1!(KcallNumber::Execv.into(), args as *const ExecvArgs as usize as u32);
+
+    // The kernel returns only on failure; a successful `execv()` replaces the image and never
+    // returns to this call site.
+    match ErrorCode::try_from(result) {
+        Ok(code) => Error::new(code, "failed to execv process"),
+        Err(error) => error,
+    }
+}
+
+//==================================================================================================
+// Lock Mutex
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Locks a mutex. If the mutex is already held, the calling thread blocks until the mutex becomes
+/// available or the optional timeout expires.
+///
+/// # Parameters
+///
+/// - `mutex_addr`: Address of the mutex to lock.
+/// - `timeout`: Optional timeout. If `None`, the call blocks indefinitely.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_lock_mutex(
+    mutex_addr: MutexAddress,
+    timeout: Option<SystemTime>,
+) -> Result<(), Error> {
+    // Attempt to convert the timeout.
+    let (seconds, nanoseconds): (u32, u32) = match timeout {
+        Some(timeout) => {
+            let seconds: u32 = timeout.seconds().try_into().map_err(|_| {
+                Error::new(ErrorCode::InvalidArgument, "timeout value is too large")
+            })?;
+            let nanoseconds: u32 = timeout.nanoseconds();
+            (seconds, nanoseconds)
+        },
+        None => (u32::MAX, u32::MAX),
+    };
+
+    let result: i64 = kcall3!(
+        KcallNumber::MutexLock.into(),
+        usize::from(mutex_addr) as u32,
+        seconds,
+        nanoseconds
+    );
+
+    // NOTE: errors are unlikely because lock typically succeeds for a valid mutex.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to lock mutex"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Unlock Mutex
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Unlocks a mutex previously locked by the calling thread.
+///
+/// # Parameters
+///
+/// - `mutex_addr`: Address of the mutex to unlock.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_unlock_mutex(mutex_addr: MutexAddress) -> Result<(), Error> {
+    let result: i64 = kcall1!(KcallNumber::MutexUnlock.into(), usize::from(mutex_addr) as u32);
+
+    // NOTE: errors are unlikely because unlock typically succeeds for a valid, held mutex.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to unlock mutex"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Signal Condition Variable
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Signals a condition variable, waking one or all waiting threads.
+///
+/// # Parameters
+///
+/// - `cond_addr`: Address of the condition variable to signal.
+/// - `broadcast`: If `true`, wakes all waiting threads. If `false`, wakes at most one.
+///
+/// # Returns
+///
+/// Upon successful completion, the number of threads awakened is returned. Upon failure, an error
+/// is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_signal_cond(cond_addr: ConditionAddress, broadcast: bool) -> Result<usize, Error> {
+    let result: i64 = kcall4!(
+        KcallNumber::CondSignal.into(),
+        usize::from(cond_addr) as u32,
+        broadcast as u32,
+        u32::MAX,
+        u32::MAX
+    );
+
+    // NOTE: errors are unlikely because signal typically succeeds for a valid condition variable.
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to signal condition variable"))
+    } else {
+        Ok(result as usize)
+    }
+}
+
+//==================================================================================================
+// Wait Condition Variable
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Waits on a condition variable. The calling thread atomically releases the associated mutex and
+/// blocks until the condition variable is signaled or the optional timeout expires.
+///
+/// # Parameters
+///
+/// - `cond_addr`: Address of the condition variable to wait on.
+/// - `mutex_addr`: Address of the mutex associated with the condition variable.
+/// - `timeout`: Optional timeout. If `None`, the call blocks indefinitely.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_wait_cond(
+    cond_addr: ConditionAddress,
+    mutex_addr: MutexAddress,
+    timeout: Option<SystemTime>,
+) -> Result<(), Error> {
+    // Attempt to convert the timeout.
+    let (seconds, nanoseconds): (u32, u32) = match timeout {
+        Some(timeout) => {
+            let seconds: u32 = timeout.seconds().try_into().map_err(|_| {
+                Error::new(ErrorCode::InvalidArgument, "timeout value is too large")
+            })?;
+            let nanoseconds: u32 = timeout.nanoseconds();
+            (seconds, nanoseconds)
+        },
+        None => (u32::MAX, u32::MAX),
+    };
+
+    let result: i64 = kcall4!(
+        KcallNumber::CondWait.into(),
+        usize::from(cond_addr) as u32,
+        usize::from(mutex_addr) as u32,
+        seconds,
+        nanoseconds
+    );
+
+    // NOTE: errors are unlikely because wait typically succeeds for valid condition/mutex.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to wait condition variable"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Get Time
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets the current system time.
+///
+/// # Parameters
+///
+/// - `buffer`: A mutable reference to a buffer where the system time will be stored.
+///
+/// # Returns
+///
+/// Upon successful completion, `gettime()` returns empty. Upon failure, it returns an `Error` to
+/// indicate the error.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_gettime(buffer: &mut SystemTime) -> Result<(), Error> {
+    let result: i64 =
+        kcall1!(KcallNumber::GetTime.into(), buffer as *mut SystemTime as usize as u32);
+
+    // NOTE: errors are unlikely because gettime typically succeeds for a valid buffer.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to get time"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Sleep
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Puts the calling thread to sleep.
+///
+/// # Parameters
+///
+/// - `timeout`: Sleep duration.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Otherwise, an error is returned instead.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_sleep(timeout: Duration) -> Result<(), Error> {
+    let seconds: u32 = timeout
+        .as_secs()
+        .try_into()
+        .map_err(|_| Error::new(ErrorCode::InvalidArgument, "timeout value is too large"))?;
+    let nanoseconds: u32 = timeout.subsec_nanos();
+
+    let result: i64 = kcall2!(KcallNumber::Sleep.into(), seconds, nanoseconds);
+
+    // NOTE: errors are unlikely because sleep typically succeeds for a valid timeout.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to sleep"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Get Thread Data Area
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets the base address for the user-space thread data area of the calling thread.
+///
+/// # Returns
+///
+/// On successful completion, this function returns the base address for the user-space thread data
+/// area of the calling thread. On failure, this function returns an error code that indicates the
+/// reason of failure.
+///
+/// # Errors
+///
+/// This function fails with the following error codes:
+///
+/// - [`ErrorCode::ValueOutOfRange`]: The thread-local pointer cannot be represented correctly.
+/// - [`ErrorCode::NoSuchEntry`]: The specified process or thread does not exist.
+/// - [`ErrorCode::ResourceBusy`]: The process manager is busy and cannot handle the request.
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_get_thread_data_area() -> Result<*mut u8, Error> {
+    let result: i64 = kcall0!(KcallNumber::GetThreadDataArea.into());
+
+    // NOTE: errors are unlikely because get_thread_data_area typically succeeds.
+    if unlikely(result < 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to get thread data area"))
+    } else {
+        Ok(result as *mut u8)
+    }
+}
+
+//==================================================================================================
+// Set Thread Data Area
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Sets the base address for the user-space thread data area of the calling thread.
+///
+/// # Parameters
+///
+/// - `user_tda`: Base address for the user-space thread data area. If null, clears the thread data area.
+///
+/// # Returns
+///
+/// On successful completion, this function returns empty. On failure, this function returns an
+/// error code that indicates the reason of failure.
+///
+/// # Errors
+///
+/// This function fails with the following error codes:
+///
+/// - [`ErrorCode::InvalidArgument`]: The provided thread-local storage pointer is invalid.
+/// - [`ErrorCode::NoSuchEntry`]: The specified process or thread does not exist.
+/// - [`ErrorCode::ResourceBusy`]: The process manager is busy and cannot handle the request.
+///
+///
+#[unsafe(no_mangle)]
+pub fn __kcall_set_thread_data_area(user_tda: *mut u8) -> Result<(), Error> {
+    let result: i64 = kcall1!(KcallNumber::SetThreadDataArea.into(), user_tda as usize as u32);
+
+    // NOTE: errors are unlikely because set_thread_data_area typically succeeds.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to set data area"))
+    } else {
+        Ok(())
+    }
+}
+
+//==================================================================================================
+// Snapshot
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Creates a snapshot of the virtual machine. The snapshot captures all guest memory and
+/// processor state into files managed by the VMM.
+///
+/// # Returns
+///
+/// Upon successful completion, empty is returned. Upon failure, an error is returned instead.
+///
+pub fn snapshot() -> Result<(), Error> {
+    let result: i64 = kcall0!(KcallNumber::Snapshot.into());
+
+    // NOTE: errors are unlikely because snapshot typically succeeds.
+    if unlikely(result != 0) {
+        Err(Error::new(ErrorCode::try_from(result)?, "failed to snapshot()"))
+    } else {
+        Ok(())
+    }
+}
+
+///
+/// # Description
+///
+/// Creates a snapshot of the virtual machine. The snapshot captures all guest memory and
+/// processor state into files managed by the VMM.
+///
+/// # Returns
+///
+/// Returns 0 on success, or a negative error code on failure.
+///
+#[unsafe(no_mangle)]
+pub extern "C" fn __kcall_snapshot() -> i32 {
+    match snapshot() {
+        Ok(()) => 0,
+        Err(e) => -(e.code as i32),
+    }
+}

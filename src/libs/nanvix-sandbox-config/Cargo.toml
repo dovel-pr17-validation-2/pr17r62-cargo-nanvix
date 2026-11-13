@@ -1,0 +1,20 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+[package]
+name = "nanvix-sandbox-config"
+version.workspace = true
+license-file.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Sandbox configuration structures for Nanvix"
+homepage.workspace = true
+
+[dependencies]
+net-backend = { workspace = true }
+
+[features]
+gdb = []
+
+[lints]
+workspace = true

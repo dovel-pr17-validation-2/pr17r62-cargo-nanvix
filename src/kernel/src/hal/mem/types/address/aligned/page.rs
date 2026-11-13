@@ -1,0 +1,340 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+include!("page.spec.rs");
+
+use crate::hal::mem::{
+    types::address::{
+        PhysicalAddress,
+        VirtualAddress,
+    },
+    Address,
+};
+use ::arch::mem::{
+    paging::FrameNumber,
+    PAGE_ALIGNMENT,
+    PAGE_SIZE,
+};
+use ::core::ops::Deref;
+use ::sys::{
+    error::{
+        Error,
+        ErrorCode,
+    },
+    mm::Alignment,
+};
+
+//==================================================================================================
+// Structures
+//==================================================================================================
+
+#[verus_verify(external_derive)]
+#[derive(Clone, Copy)]
+pub struct PageAligned<T: Address>(T);
+
+#[verus_verify]
+impl<T: Address> PageAligned<T> {
+    /// Constructs a page address from an aligned virtual address.
+    #[verus_spec(ret =>
+        ensures
+            match ret {
+                Ok(r) => spec_aligned(addr@) && r@ == addr@ && r.inv(),
+                Err(e) => !spec_aligned(addr@) && e.code == ErrorCode::BadAddress,
+            },
+    )]
+    pub fn from_address(addr: T) -> Result<Self, Error> {
+        // Check if `addr` is not aligned to a page boundary.
+        if !addr.is_aligned(PAGE_ALIGNMENT)? {
+            return Err(Error::new(ErrorCode::BadAddress, "unaligned virtual address"));
+        }
+
+        Ok(Self(addr))
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+verus! {
+
+impl<T: Address> Address for PageAligned<T> {
+    // A raw value yields a valid `PageAligned<T>` exactly when it is valid for the inner address
+    // type `T` *and* page-aligned. This mirrors `from_address`, which validates (but does not
+    // normalize) alignment, so `from_raw_value` returns `Ok` iff both conditions hold.
+    open spec fn spec_valid_raw(raw_addr: usize) -> bool {
+        T::spec_valid_raw(raw_addr) && spec_aligned(raw_addr as int)
+    }
+
+    fn into_raw_value(self) -> usize {
+        self.0.into_raw_value()
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Instantiates a new [`PageAligned`] from a raw value.
+    ///
+    /// # Parameters
+    ///
+    /// - `raw_addr`: The raw value.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Self)`: The new address.
+    /// - `Err(Error::BadAddress)`: If the provided address is invalid.
+    ///
+    fn from_raw_value(raw_addr: usize) -> Result<Self, Error> {
+        Self::from_address(T::from_raw_value(raw_addr)?)
+    }
+
+    ///
+    /// # Description
+    ///
+    ///  Aligns the target [`PageAligned`] to the provided `alignment`. If the address is already
+    /// aligned, it is returned as is.
+    ///
+    /// # Parameters
+    ///
+    /// - `alignment`: The alignment to align the target address to.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the aligned address is returned. Upon failure, an error is returned instead.
+    ///
+    fn align_up(&self, align: Alignment) -> Result<Self, Error> {
+        Self::from_address(self.0.align_up(align)?)
+    }
+    ///
+    /// # Description
+    ///
+    /// Aligns the target [`PageAligned`] down to the provided `alignment`. If the address is
+    /// already aligned, it is returned as is.
+    ///
+    /// # Parameters
+    ///
+    /// - `alignment`: The alignment to align the target address to.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the aligned address is returned. Upon failure, an error is returned instead.
+    ///
+    fn align_down(&self, align: Alignment) -> Result<Self, Error> {
+        Self::from_address(self.0.align_down(align)?)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Checks if the target [`PageAligned`] is aligned to the provided `alignment`.
+    ///
+    /// # Parameters
+    ///
+    /// - `alignment`: The alignment to check.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, `true` is returned if the address is aligned, otherwise `false`. Upon failure,
+    /// an error is returned instead.
+    ///
+    fn is_aligned(&self, align: Alignment) -> Result<bool, Error> {
+        self.0.is_aligned(align)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the maximum address for [`PageAligned`].
+    ///
+    /// # Returns
+    ///
+    /// The maximum [`PageAligned`].
+    ///
+    fn max_addr() -> usize {
+        T::max_addr()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+}
+
+} // verus!
+
+impl<T: Address> core::fmt::Debug for PageAligned<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl<T: Address> Deref for PageAligned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Address> PartialEq for PageAligned<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(other)
+    }
+}
+
+impl<T: Address> Eq for PageAligned<T> {}
+
+impl<T: Address> PartialOrd for PageAligned<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: Address> Ord for PageAligned<T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.cmp(other)
+    }
+}
+
+impl PageAligned<VirtualAddress> {
+    /// Converts a page-aligned virtual address to a page-aligned physical address.
+    pub fn into_physical_address(self) -> Result<PageAligned<PhysicalAddress>, Error> {
+        PageAligned::from_address(PhysicalAddress::from_raw_value(self.into_raw_value())?)
+    }
+}
+
+impl PageAligned<PhysicalAddress> {
+    /// Converts a page-aligned physical address to a page-aligned virtual address.
+    pub fn into_virtual_address(self) -> PageAligned<VirtualAddress> {
+        // Safety: the following unwrap is safe because the address is already page-aligned.
+        PageAligned::from_address(self.0.into_virtual_address()).unwrap()
+    }
+
+    /// Converts a page-aligned physical address into its frame number.
+    #[verus_verify]
+    #[verus_spec(result =>
+        ensures
+            result@ == self@ / (::arch::mem::PAGE_SIZE as int),
+    )]
+    pub fn into_frame_number(self) -> FrameNumber {
+        FrameNumber::from(self.0)
+    }
+}
+
+// `View` is a supertrait of `Address`, which `PageAligned<T>` implements in exec code, so this
+// impl must be present in normal builds too — it stays in an ungated `verus!` block (the spec
+// `inv` lives in `page.spec.rs`).
+verus! {
+
+impl<T: Address> View for PageAligned<T>
+{
+    type V = int;
+
+    closed spec fn view(&self) -> int
+    {
+        self.0@
+    }
+}
+
+}
+
+//==================================================================================================
+// Page Range
+//==================================================================================================
+
+///
+/// # Description
+///
+/// An iterator over the page-aligned virtual addresses of a range of consecutive pages.
+///
+/// # Notes
+///
+/// A range is validated once, when it is created, so iterating over it cannot fail: the range
+/// starts at a page-aligned address, it spans a whole number of pages, and its last page lies
+/// within the virtual address space. Every address that the range yields is thus page-aligned by
+/// construction, and computing it cannot overflow.
+///
+#[derive(Clone, Debug)]
+pub struct PageRange {
+    /// Address of the first page in the range.
+    start: PageAligned<VirtualAddress>,
+    /// Number of pages in the range.
+    npages: usize,
+    /// Index of the next page to yield.
+    next: usize,
+}
+
+impl PageRange {
+    ///
+    /// # Description
+    ///
+    /// Creates a range that covers the pages of the virtual memory region that starts at `start`
+    /// and spans `size` bytes.
+    ///
+    /// # Parameters
+    ///
+    /// - `start`: Page-aligned virtual address of the first page in the range.
+    /// - `size`: Size of the range in bytes, which must be a multiple of the page size.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the new range is returned. Upon failure, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::InvalidArgument`]: `size` is not a multiple of the page size.
+    /// - [`ErrorCode::ValueOverflow`]: The range extends beyond the end of the virtual address
+    ///   space.
+    ///
+    pub fn new(start: PageAligned<VirtualAddress>, size: usize) -> Result<Self, Error> {
+        // Check if the range does not span a whole number of pages.
+        if !size.is_multiple_of(PAGE_SIZE) {
+            let reason: &str = "range size is not a multiple of the page size";
+            error!("PageRange::new(): {reason} (start={start:?}, size={size:#x})");
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+
+        // Check if the last page of the range lies beyond the end of the virtual address space.
+        let npages: usize = size / PAGE_SIZE;
+        let start_raw: usize = start.into_raw_value();
+        if npages > 0 && start_raw.checked_add(size - PAGE_SIZE).is_none() {
+            let reason: &str = "range extends beyond the end of the virtual address space";
+            error!("PageRange::new(): {reason} (start={start:?}, size={size:#x})");
+            return Err(Error::new(ErrorCode::ValueOverflow, reason));
+        }
+
+        Ok(Self {
+            start,
+            npages,
+            next: 0,
+        })
+    }
+}
+
+impl Iterator for PageRange {
+    type Item = PageAligned<VirtualAddress>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Check if all pages in the range have been yielded.
+        if self.next >= self.npages {
+            return None;
+        }
+
+        // The following arithmetic cannot overflow, because `PageRange::new()` checked that the
+        // last page of the range lies within the virtual address space. The resulting address is
+        // page-aligned, because it lies a whole number of pages above a page-aligned address.
+        let raw_addr: usize = self.start.into_raw_value() + self.next * PAGE_SIZE;
+        self.next += 1;
+
+        Some(PageAligned(VirtualAddress::new(raw_addr)))
+    }
+}

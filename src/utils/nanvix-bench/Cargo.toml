@@ -1,0 +1,39 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+[package]
+name = "nanvix-bench"
+version.workspace = true
+license-file.workspace = true
+edition = "2024"
+authors.workspace = true
+description = "Benchmark Utility for Nanvix"
+homepage.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+build-utils = { workspace = true }
+fatfs = { workspace = true, features = ["std", "alloc", "lfn"] }
+indicatif = { workspace = true }
+koptions = { workspace = true, features = ["std"] }
+log = { workspace = true }
+nanvixd = { workspace = true }
+nanvix = { workspace = true, features = ["internal-api"] }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true, features = ["std"] }
+syscall-bench-common = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+user-vm-api = { workspace = true }
+vfs-bench-common = { workspace = true }
+
+[features]
+default = ["microvm", "profile-time"]
+gdb = ["microvm", "nanvix/gdb"]
+# Enables fine-grained time profiling.
+profile-time = ["nanvixd/profile-time", "nanvix/profile-time"]
+microvm = ["nanvix/microvm"]
+whp = ["nanvix/whp"]
+
+[lints]
+workspace = true

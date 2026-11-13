@@ -1,0 +1,151 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for locale.h.
+# The gen-headers tool combines this with the extern "C" signatures parsed
+# from this crate's sources to produce include/locale.h.
+
+file = "locale.h"
+brief = "Localization."
+description = """
+Declares functions and types for locale-specific formatting. Only the
+C/POSIX locale is supported. Implemented by the libc_locale Rust crate."""
+includes = ["stddef.h"]
+guard = "_NANVIX_LOCALE_H"
+# Emit the type block (which defines `locale_t`) before the constants so that the
+# `LC_GLOBAL_LOCALE` macro, whose value casts to `locale_t`, follows the typedef.
+content_order = ["rust_types", "rust_constants", "section:0", "section:1"]
+
+[[rust_constants]]
+path = "setlocale::LC_CTYPE"
+c_declaration = '''
+#define LC_CTYPE 0
+#define LC_NUMERIC 1
+#define LC_TIME 2
+#define LC_COLLATE 3
+#define LC_MONETARY 4
+#define LC_MESSAGES 5
+#define LC_ALL 6
+#define LC_CTYPE_MASK (1 << LC_CTYPE)
+#define LC_NUMERIC_MASK (1 << LC_NUMERIC)
+#define LC_TIME_MASK (1 << LC_TIME)
+#define LC_COLLATE_MASK (1 << LC_COLLATE)
+#define LC_MONETARY_MASK (1 << LC_MONETARY)
+#define LC_MESSAGES_MASK (1 << LC_MESSAGES)
+#define LC_ALL_MASK (LC_CTYPE_MASK | LC_NUMERIC_MASK | LC_TIME_MASK | LC_COLLATE_MASK | LC_MONETARY_MASK | LC_MESSAGES_MASK)
+#define LC_GLOBAL_LOCALE ((locale_t) -1)'''
+no_comment = true
+
+[[rust_constants]]
+path = "setlocale::LC_NUMERIC"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_TIME"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_COLLATE"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_MONETARY"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_MESSAGES"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_ALL"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_CTYPE_MASK"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_NUMERIC_MASK"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_TIME_MASK"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_COLLATE_MASK"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_MONETARY_MASK"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_MESSAGES_MASK"
+emit = false
+
+[[rust_constants]]
+path = "setlocale::LC_ALL_MASK"
+emit = false
+
+[[rust_constants]]
+path = "xlocale::LC_GLOBAL_LOCALE"
+emit = false
+
+[[rust_types]]
+path = "xlocale::locale_t"
+c_only_reason = "_LOCALE_T_DEFINED is a C typedef ownership guard."
+c_bindings = { lconv = "localeconv::lconv" }
+c_declaration = """
+#ifndef _LOCALE_T_DEFINED
+#define _LOCALE_T_DEFINED
+typedef void *locale_t;
+#endif
+
+/** @brief Locale-specific numeric formatting information. */
+struct lconv {
+    char *decimal_point;     /**< Decimal point character.            */
+    char *thousands_sep;     /**< Thousands separator.                */
+    char *grouping;          /**< Digit grouping.                     */
+    char *int_curr_symbol;   /**< International currency symbol.      */
+    char *currency_symbol;   /**< Local currency symbol.              */
+    char *mon_decimal_point; /**< Monetary decimal point.             */
+    char *mon_thousands_sep; /**< Monetary thousands separator.       */
+    char *mon_grouping;      /**< Monetary digit grouping.            */
+    char *positive_sign;     /**< Positive sign string.               */
+    char *negative_sign;     /**< Negative sign string.               */
+    char int_frac_digits;    /**< International fractional digits.    */
+    char frac_digits;        /**< Local fractional digits.            */
+    char p_cs_precedes;      /**< Currency symbol precedes positive.  */
+    char p_sep_by_space;     /**< Space separates symbol and positive.*/
+    char n_cs_precedes;      /**< Currency symbol precedes negative.  */
+    char n_sep_by_space;     /**< Space separates symbol and negative.*/
+    char p_sign_posn;        /**< Positive sign position.             */
+    char n_sign_posn;        /**< Negative sign position.             */
+    char int_p_cs_precedes;  /**< Int. symbol precedes positive.      */
+    char int_p_sep_by_space; /**< Int. space separates positive.      */
+    char int_n_cs_precedes;  /**< Int. symbol precedes negative.      */
+    char int_n_sep_by_space; /**< Int. space separates negative.      */
+    char int_p_sign_posn;    /**< Int. positive sign position.        */
+    char int_n_sign_posn;    /**< Int. negative sign position.        */
+};
+"""
+
+[[rust_types]]
+path = "localeconv::lconv"
+style = "tag"
+emit = false
+
+[[sections]]
+title = "Functions"
+functions = ["setlocale", "localeconv"]
+
+[[sections]]
+title = "Locale Management"
+functions = ["newlocale", "duplocale", "freelocale", "uselocale"]
+
+[overrides]
+newlocale = "extern locale_t newlocale(int category_mask, const char *locale, locale_t base);"
+duplocale = "extern locale_t duplocale(locale_t locobj);"
+freelocale = "extern void freelocale(locale_t locobj);"
+uselocale = "extern locale_t uselocale(locale_t newloc);"

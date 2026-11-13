@@ -1,0 +1,94 @@
+/*
+ * Copyright(c) The Maintainers of Nanvix.
+ * Licensed under the MIT License.
+ */
+
+#ifndef _NANVIX_SYS_IOCTL_H
+#define _NANVIX_SYS_IOCTL_H
+
+/**
+ * @file sys/ioctl.h
+ * @brief Device control operations.
+ *
+ * Declares `ioctl()` and the terminal-control requests used by interactive
+ * ports. In standalone mode the terminal-attribute and window-size requests
+ * (`TCGETS`/`TCSETS`/`TIOCGWINSZ`/`TIOCSWINSZ`) are served by the vfsd console
+ * backend, while foreground process-group requests (`TIOCGPGRP`/`TIOCSPGRP`)
+ * are served by procd; hosted deployments have no guest terminal device and
+ * ignore them.
+ */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*==================================================================================================
+ * Structures
+ *==================================================================================================*/
+
+/** @brief Terminal window size. */
+struct winsize {
+    unsigned short ws_row;    /**< Rows, in characters.    */
+    unsigned short ws_col;    /**< Columns, in characters. */
+    unsigned short ws_xpixel; /**< Horizontal size, pixels. */
+    unsigned short ws_ypixel; /**< Vertical size, pixels.   */
+};
+
+/*==================================================================================================
+ * Requests
+ *==================================================================================================*/
+
+#define TCGETS 0x5401
+#define TCSETS 0x5402
+#define TIOCGPGRP 0x540f
+#define TIOCSPGRP 0x5410
+#define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+#define FIONREAD 0x541b
+
+/*==================================================================================================
+ * Request Encoding
+ *==================================================================================================*/
+
+/*
+ * Request-number encoding macros, compatible with the Linux/i386 `_IOC`
+ * scheme. Nanvix device drivers use the fixed request numbers above; these
+ * macros are provided so that portable software (which constructs request
+ * numbers with `_IO`/`_IOR`/`_IOW`/`_IOWR`) compiles and links. Requests built
+ * this way that Nanvix does not recognize are ignored: `ioctl()` returns 0
+ * without acting on the device.
+ */
+#define _IOC_NRBITS   8
+#define _IOC_TYPEBITS 8
+#define _IOC_SIZEBITS 14
+#define _IOC_DIRBITS  2
+
+#define _IOC_NRSHIFT   0
+#define _IOC_TYPESHIFT (_IOC_NRSHIFT + _IOC_NRBITS)
+#define _IOC_SIZESHIFT (_IOC_TYPESHIFT + _IOC_TYPEBITS)
+#define _IOC_DIRSHIFT  (_IOC_SIZESHIFT + _IOC_SIZEBITS)
+
+#define _IOC_NONE  0U
+#define _IOC_WRITE 1U
+#define _IOC_READ  2U
+
+#define _IOC(dir, type, nr, size) \
+    (((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) | \
+     ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))
+
+#define _IO(type, nr)         _IOC(_IOC_NONE, (type), (nr), 0)
+#define _IOR(type, nr, size)  _IOC(_IOC_READ, (type), (nr), sizeof(size))
+#define _IOW(type, nr, size)  _IOC(_IOC_WRITE, (type), (nr), sizeof(size))
+#define _IOWR(type, nr, size) _IOC(_IOC_READ | _IOC_WRITE, (type), (nr), sizeof(size))
+
+/*==================================================================================================
+ * Functions
+ *==================================================================================================*/
+
+extern int ioctl(int fd, unsigned long request, ...);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _NANVIX_SYS_IOCTL_H */

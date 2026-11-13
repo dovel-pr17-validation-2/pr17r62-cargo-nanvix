@@ -1,0 +1,90 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Verify"
+description: "Run Verus formal verification on annotated kernel crates"
+
+inputs:
+  machine-type:
+    description: "Machine type"
+    required: true
+    default: "microvm"
+  target:
+    description: "Target architecture (e.g. x86, x86_64)"
+    required: false
+    default: "x86"
+  github-token:
+    description: "GitHub token for authenticated Verus downloads"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Resolve Verus Version"
+      id: verus-version
+      shell: bash
+      run: echo "version=$(tr -d '[:space:]' < build/verus-version)" >>
+        "$GITHUB_OUTPUT"
+
+    - name: "Restore Verus Archive Cache"
+      id: verus-cache
+      uses: actions/cache/restore@v5
+      with:
+        path: .verus-cache
+        key: verus-${{ runner.os }}-${{ steps.verus-version.outputs.version }}
+
+    - name: "Pre-download Verus Archive (Linux)"
+      if: runner.os == 'Linux' && steps.verus-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: python3 scripts/setup/verus.py --download-only
+
+    - name: "Pre-download Verus Archive (Windows)"
+      if: runner.os == 'Windows' && steps.verus-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: python .\scripts\setup\verus.py --download-only
+
+    - name: "Install Verus (Linux)"
+      if: runner.os == 'Linux'
+      shell: bash
+      run: python3 scripts/setup/verus.py "${HOME}/toolchain/verus"
+
+    - name: "Install Verus (Windows)"
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: python .\scripts\setup\verus.py "$env:USERPROFILE\verus"
+
+    - name: "Verify (Linux)"
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        ./z build -- verify \
+          "VERUS_EXECUTABLE_DIR=${HOME}/toolchain/verus" \
+          "MACHINE=${{ inputs.machine-type }}" \
+          TARGET=${{ inputs.target }} \
+          LOG_LEVEL=trace \
+          VERBOSE=yes \
+          BUILD_OPT=no
+
+    - name: "Verify (Windows)"
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        .\z.ps1 verify -- `
+          "VERUS_EXECUTABLE_DIR=$env:USERPROFILE\verus" `
+          "MACHINE=${{ inputs.machine-type }}" `
+          TARGET=${{ inputs.target }} `
+          LOG_LEVEL=trace `
+          VERBOSE=yes `
+          BUILD_OPT=no
+
+    - name: "Save Verus Archive Cache"
+      if: steps.verus-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: .verus-cache
+        key: verus-${{ runner.os }}-${{ steps.verus-version.outputs.version }}

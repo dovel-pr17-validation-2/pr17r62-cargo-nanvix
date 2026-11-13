@@ -1,0 +1,89 @@
+/*
+ * Copyright(c) The Maintainers of Nanvix.
+ * Licensed under the MIT License.
+ */
+
+#ifndef _NANVIX_SYS_MMAN_H
+#define _NANVIX_SYS_MMAN_H
+
+/**
+ * @file sys/mman.h
+ * @brief Memory management declarations.
+ *
+ * Declares the memory-mapping protection and flag constants and the mmap/munmap
+ * interfaces. Constants mirror the Rust definitions in the sysapi crate
+ * (sys_mman.rs).
+ */
+
+#include <sys/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*==================================================================================================
+ * Constants
+ *==================================================================================================*/
+
+#define PROT_NONE 0x0 /**< Page cannot be accessed. */
+#define PROT_READ 0x1 /**< Page can be read. */
+#define PROT_WRITE 0x2 /**< Page can be written. */
+#define PROT_EXEC 0x4 /**< Page can be executed. */
+#define MAP_SHARED 0x01 /**< Share changes. */
+#define MAP_PRIVATE 0x02 /**< Changes are private. */
+#define MAP_FIXED 0x10 /**< Interpret the address exactly. */
+#define MAP_ANONYMOUS 0x20 /**< Anonymous mapping (not backed by a file). */
+#define MS_ASYNC 0x1 /**< Perform asynchronous writes. */
+#define MS_INVALIDATE 0x2 /**< Invalidate cached copies of mapped data. */
+#define MS_SYNC 0x4 /**< Perform synchronous writes. */
+#define MADV_NORMAL 0 /**< No special treatment. */
+#define MADV_RANDOM 1 /**< Expect page references in random order. */
+#define MADV_SEQUENTIAL 2 /**< Expect page references in sequential order. */
+#define MADV_WILLNEED 3 /**< Expect access in the near future. */
+#define MADV_DONTNEED 4 /**< Do not expect access in the near future. */
+#define MADV_FREE 8 /**< Contents of the pages may be discarded. */
+#define MCL_CURRENT 0x1 /**< Lock all currently mapped pages. */
+#define MCL_FUTURE 0x2 /**< Lock all pages mapped in the future. */
+
+/** @brief Returned by mmap() on failure. */
+#define MAP_FAILED ((void *)-1)
+
+/*==================================================================================================
+ * Memory Mapping
+ *==================================================================================================*/
+
+extern void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+extern int munmap(void *addr, size_t length);
+
+/*==================================================================================================
+ * Memory Protection
+ *==================================================================================================*/
+
+extern int mprotect(void *addr, size_t length, int prot);
+
+/*==================================================================================================
+ * Memory Locking
+ *==================================================================================================*/
+
+extern int mlock(const void *addr, size_t len);
+extern int munlock(const void *addr, size_t len);
+extern int mlockall(int flags);
+extern int munlockall(void);
+
+/*==================================================================================================
+ * Memory Synchronization
+ *==================================================================================================*/
+
+extern int msync(void *addr, size_t length, int flags);
+
+/*==================================================================================================
+ * Memory Advice
+ *==================================================================================================*/
+
+extern int madvise(void *addr, size_t length, int advice);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _NANVIX_SYS_MMAN_H */

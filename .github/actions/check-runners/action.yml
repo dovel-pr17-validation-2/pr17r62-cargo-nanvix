@@ -1,0 +1,91 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Check Self-Hosted Runners"
+description: "Check whether repository runners matching a given OS, name
+  prefix, and label are online. Call once per OS to get per-platform
+  availability."
+
+# NOTE: The /repos/{owner}/{repo}/actions/runners endpoint requires the
+# 'administration:read' permission, which is NOT available to the default
+# GITHUB_TOKEN. If the call fails (403), the action fails closed and outputs
+# 'false' so dependent benchmark jobs are skipped rather than queuing
+# indefinitely on offline self-hosted runners. To enable accurate
+# availability detection, store a fine-grained PAT with 'Administration:
+# Read' as the RUNNER_ADMIN_TOKEN secret and pass it via the github-token
+# input.
+
+inputs:
+  github-token:
+    description: "Token with administration:read scope for listing runners.
+      When the token lacks sufficient permissions the action fails closed
+      and reports runners as unavailable."
+    required: true
+  os:
+    description: "Runner OS label to match (e.g. 'Linux' or 'Windows')."
+    required: true
+  runner-name-prefix:
+    description: "Only consider runners whose name starts with this prefix
+      (e.g. 'Prometheus').  Leave empty to consider all self-hosted runners."
+    required: false
+    default: ""
+  runner-label:
+    description: "Custom repository runner label to match (e.g. 'benchmark')."
+    required: true
+
+outputs:
+  available:
+    description: "'true' if at least one matching self-hosted runner is online, 'false' otherwise"
+    value: ${{ steps.check.outputs.available }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Check Runner Availability"
+      id: check
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        CHECK_OS: ${{ inputs.os }}
+        RUNNER_NAME_PREFIX: ${{ inputs.runner-name-prefix }}
+        RUNNER_LABEL: ${{ inputs.runner-label }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        api_err_file=$(mktemp)
+
+        if ! runners_json=$(gh api --paginate \
+          "repos/${GITHUB_REPOSITORY}/actions/runners" 2>"${api_err_file}"); then
+          api_err=$(cat "${api_err_file}")
+          echo "::warning::Could not query repository runners " \
+            "(${api_err:-unknown error}) — reporting runners as unavailable so " \
+            "dependent jobs are skipped."
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          rm -f "${api_err_file}"
+          exit 0
+        fi
+        rm -f "${api_err_file}"
+        echo "Queried repository-level runners for '${GITHUB_REPOSITORY}'."
+
+        count=$(echo "${runners_json}" | jq --arg os "${CHECK_OS}" \
+          --arg prefix "${RUNNER_NAME_PREFIX}" --arg label "${RUNNER_LABEL}" \
+          '[ .runners[]
+            | select(
+                .status == "online"
+                and (
+                  .labels
+                  | map(.name) as $actual
+                  | ["self-hosted", $os, $label]
+                  | all(. as $required | $actual | index($required) != null)
+                )
+                and ($prefix == "" or (.name | startswith($prefix)))
+              )
+          ] | length')
+        if [ "${count}" -gt 0 ]; then
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "${CHECK_OS} self-hosted runners online: ${count}"
+        else
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::No ${CHECK_OS} self-hosted runners with label " \
+            "'${RUNNER_LABEL}' are online — dependent jobs will be skipped."
+        fi

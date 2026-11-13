@@ -1,0 +1,1419 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use crate::{
+    hal::mem::{
+        AccessPermission,
+        FrameAddress,
+        PageAligned,
+        VirtualAddress,
+    },
+    ipc::Mailbox,
+    mm::{
+        phys::{
+            PhysMemoryManager,
+            UserFrame,
+        },
+        VirtMemoryManager,
+        Vmem,
+    },
+    pm::{
+        new_test_delivery_sequence,
+        DeliverySequence,
+        ProcessManager,
+    },
+};
+use ::arch::{
+    cpu::excp::ErrorCode as PageFaultErrorCode,
+    mem::paging::PageTableEntry,
+};
+use ::core::mem::ManuallyDrop;
+use ::sys::{
+    error::{
+        Error,
+        ErrorCode,
+    },
+    event::{
+        Event,
+        InterruptEvent,
+        SchedulingEvent,
+    },
+    ipc::{
+        Message,
+        MessageReceiver,
+        MessageSender,
+        MessageType,
+    },
+    mm::Address,
+    pm::{
+        ProcessIdentifier,
+        ThreadIdentifier,
+    },
+};
+
+//==================================================================================================
+// Tests
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Verifies that a freshly constructed mailbox reports as empty, and that posting a single
+/// message causes it to report as non-empty.
+///
+/// # Returns
+///
+/// `true` if empty-state tracking and empty-mailbox commit rejection are correct, otherwise
+/// `false`.
+///
+fn test_mailbox_is_empty_tracks_buffered_messages() -> bool {
+    let mut mailbox: Mailbox = Mailbox::default();
+    if !mailbox.is_empty() {
+        error!("freshly constructed mailbox reported as non-empty");
+        return false;
+    }
+    if mailbox.commit(ThreadIdentifier::from(42), new_test_delivery_sequence(0)) {
+        error!("empty mailbox accepted a delivery commit");
+        return false;
+    }
+
+    let message: Message = Message::new(
+        MessageSender::KERNEL,
+        MessageReceiver::KERNEL,
+        MessageType::Ipc,
+        Option::<ErrorCode>::None,
+        [0u8; Message::PAYLOAD_SIZE],
+    );
+    mailbox.send(new_test_delivery_sequence(0), message);
+    if mailbox.is_empty() {
+        error!("mailbox reported as empty after sending a message");
+        return false;
+    }
+    true
+}
+
+///
+/// # Description
+///
+/// Verifies that mailbox purge operations report how many messages they remove.
+///
+/// # Returns
+///
+/// `true` if thread-specific and whole-mailbox purges remove the expected entries, otherwise
+/// `false`.
+///
+fn test_mailbox_purge_counts_removed_messages() -> bool {
+    let mut mailbox: Mailbox = Mailbox::default();
+    let tid: ThreadIdentifier = ThreadIdentifier::from(42);
+    let thread_receiver: MessageReceiver = MessageReceiver::new(ProcessIdentifier::KERNEL, tid);
+    let process_receiver: MessageReceiver =
+        MessageReceiver::new(ProcessIdentifier::KERNEL, ThreadIdentifier::NONE);
+    for (sequence, receiver) in [thread_receiver, process_receiver].into_iter().enumerate() {
+        mailbox.send(
+            new_test_delivery_sequence(sequence as u64),
+            Message::new(
+                MessageSender::KERNEL,
+                receiver,
+                MessageType::Ipc,
+                Option::<ErrorCode>::None,
+                [0u8; Message::PAYLOAD_SIZE],
+            ),
+        );
+    }
+
+    if mailbox.purge_thread(tid) != 1 {
+        error!("thread-message purge removed an unexpected number of messages");
+        return false;
+    }
+    if mailbox.purge_all() != 1 {
+        error!("whole-mailbox purge removed an unexpected number of messages");
+        return false;
+    }
+    if !mailbox.is_empty() {
+        error!("mailbox remained non-empty after purging every message");
+        return false;
+    }
+    true
+}
+
+///
+/// # Description
+///
+/// Verifies that an older process-directed message is delivered before a newer exact-thread
+/// message when both are eligible for the receiving thread.
+///
+/// # Returns
+///
+/// `true` if selection, retry, commit, and following-entry exposure preserve mailbox ordering,
+/// otherwise `false`.
+///
+fn test_mailbox_selects_oldest_eligible_message() -> bool {
+    let mut mailbox: Mailbox = Mailbox::default();
+    let tid: ThreadIdentifier = ThreadIdentifier::from(42);
+    let other_tid: ThreadIdentifier = ThreadIdentifier::from(43);
+    let other_receiver: MessageReceiver =
+        MessageReceiver::new(ProcessIdentifier::KERNEL, other_tid);
+    let process_receiver: MessageReceiver =
+        MessageReceiver::new(ProcessIdentifier::KERNEL, ThreadIdentifier::NONE);
+    let thread_receiver: MessageReceiver = MessageReceiver::new(ProcessIdentifier::KERNEL, tid);
+
+    mailbox.send(
+        new_test_delivery_sequence(0),
+        Message::new(
+            MessageSender::KERNEL,
+            other_receiver,
+            MessageType::Ipc,
+            Option::<ErrorCode>::None,
+            [0u8; Message::PAYLOAD_SIZE],
+        ),
+    );
+    mailbox.send(
+        new_test_delivery_sequence(1),
+        Message::new(
+            MessageSender::KERNEL,
+            process_receiver,
+            MessageType::Ipc,
+            Option::<ErrorCode>::None,
+            [0u8; Message::PAYLOAD_SIZE],
+        ),
+    );
+    mailbox.send(
+        new_test_delivery_sequence(2),
+        Message::new(
+            MessageSender::KERNEL,
+            thread_receiver,
+            MessageType::Ipc,
+            Option::<ErrorCode>::None,
+            [0u8; Message::PAYLOAD_SIZE],
+        ),
+    );
+
+    let first_sequence: DeliverySequence = match mailbox.peek(tid) {
+        Some((sequence, _)) => sequence,
+        None => {
+            error!("eligible mailbox message was not selected");
+            return false;
+        },
+    };
+    let retry_sequence: Option<DeliverySequence> = mailbox.peek(tid).map(|(sequence, _)| sequence);
+    if first_sequence != new_test_delivery_sequence(1)
+        || retry_sequence != Some(first_sequence)
+        || !mailbox.test_token_is_current(tid, first_sequence)
+    {
+        error!("mailbox retry did not preserve the selected sequence");
+        return false;
+    }
+    if !mailbox.commit(tid, first_sequence) {
+        error!("selected mailbox message could not be committed");
+        return false;
+    }
+    if mailbox.test_token_is_current(tid, first_sequence) {
+        error!("committed mailbox token did not become stale");
+        return false;
+    }
+    if mailbox.peek(other_tid).map(|(sequence, _)| sequence) != Some(new_test_delivery_sequence(0))
+    {
+        error!("mailbox commit removed the older entry for another thread");
+        return false;
+    }
+    if mailbox.peek(tid).map(|(sequence, _)| sequence) != Some(new_test_delivery_sequence(2)) {
+        error!("mailbox commit did not expose the next eligible message");
+        return false;
+    }
+
+    true
+}
+
+/// Verifies that scheduling ownership guards are removed class-wide, while other event classes
+/// retain exact-event matching.
+fn test_event_guard_matching_follows_ownership_scope() -> bool {
+    use crate::pm::process::state::event_guard_matches;
+
+    let creation: Event = Event::Scheduling(SchedulingEvent::ProcessCreation);
+    let termination: Event = Event::Scheduling(SchedulingEvent::ProcessTermination);
+    let thread_termination: Event = Event::Scheduling(SchedulingEvent::ThreadTermination);
+    if !event_guard_matches(&creation, &termination)
+        || !event_guard_matches(&creation, &thread_termination)
+    {
+        error!("scheduling events did not match their class-wide ownership guard");
+        return false;
+    }
+
+    let first_interrupt: Event = Event::Interrupt(InterruptEvent::VALUES[0]);
+    let second_interrupt: Event = Event::Interrupt(InterruptEvent::VALUES[1]);
+    if !event_guard_matches(&first_interrupt, &first_interrupt)
+        || event_guard_matches(&first_interrupt, &second_interrupt)
+    {
+        error!("interrupt ownership guards did not use exact-event matching");
+        return false;
+    }
+
+    true
+}
+
+///
+/// # Description
+///
+/// Verifies that the kernel process (the process running at kernel-test time) does not own any
+/// special resources, i.e. that [`crate::pm::process::state::ProcessState::has_special_resources`]
+/// returns `false` for the kernel process. This is the precondition that allows the
+/// `duplicate()` kernel call to succeed.
+///
+fn test_kernel_process_has_no_special_resources() -> bool {
+    // SAFETY: the process manager is initialized and access is synchronized.
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+    if pm.current_has_special_resources() {
+        error!("kernel process unexpectedly owns special resources");
+        return false;
+    }
+    true
+}
+
+///
+/// # Description
+///
+/// End-to-end exercise of the copy-on-write resolution path.
+///
+/// Sets up a single user page that is shared between the page table of a freshly created
+/// virtual memory space and a standalone [`UserFrame`] handle (the latter standing in for the
+/// "other" address space that would normally co-own the frame after a fork-style duplication).
+/// The page is then marked copy-on-write, and [`Vmem::resolve_cow_at`] is invoked to verify
+/// that:
+///
+/// - the call reports the fault as resolved (`Ok(true)`),
+/// - the page-table entry is rewritten to a *different* frame number,
+/// - the rewritten entry is writable and no longer carries the copy-on-write bit, and
+/// - dropping the lingering shared handle releases the last reference to the original frame
+///   (otherwise the resolver would have failed to drop its reference).
+///
+fn test_cow_resolution_creates_private_frame() -> bool {
+    // Pick a page-aligned user-space virtual address that is guaranteed not to overlap any
+    // mapping the kernel process already owns. `USER_MMAP_BASE_RAW` is the base of the
+    // user-mmap region and is reserved for ad-hoc user mappings.
+    const TEST_VADDR_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW;
+
+    let vaddr: PageAligned<VirtualAddress> =
+        match PageAligned::<VirtualAddress>::from_raw_value(TEST_VADDR_RAW) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("PageAligned::from_raw_value failed (error={e:?})");
+                return false;
+            },
+        };
+
+    // SAFETY: pm/init() runs after the physical and virtual memory managers are initialized;
+    // access is synchronized because the kernel is single-threaded with interrupts disabled.
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+    let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+
+    // Build a fresh address space cloned off the kernel process's vmem so the test does not
+    // disturb the running kernel mappings.
+    let mut parent: Vmem = match mm.new_vmem(pm.current_vmem()) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("new_vmem failed (error={e:?})");
+            return false;
+        },
+    };
+
+    // Allocate a user frame and create a second handle aliasing the same physical frame.
+    // The second handle stands in for the "other" address space that co-owns the frame.
+    let uframe1: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame failed (error={e:?})");
+            return false;
+        },
+    };
+    let uframe2: UserFrame = match uframe1.share() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("UserFrame::share failed (error={e:?})");
+            return false;
+        },
+    };
+
+    // Map the first handle into `parent` at the test address. `Vmem::map` leaks the handle
+    // into the page table, so it must not be referenced again from this function.
+    if let Err(e) = parent.map(uframe1, vaddr, AccessPermission::RDWR) {
+        error!("Vmem::map failed (error={e:?})");
+        drop(uframe2);
+        return false;
+    }
+
+    // Mark the page copy-on-write.
+    if let Err(e) = parent.mark_user_page_cow(vaddr) {
+        error!("mark_user_page_cow failed (error={e:?})");
+        drop(uframe2);
+        return false;
+    }
+
+    // After marking, the PTE must be present, read-only, carry the CoW bit, and still point at
+    // the original (shared) frame.
+    let before: PageTableEntry = match parent.try_find_user_pte(vaddr) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("PTE missing after map + mark_user_page_cow");
+            drop(uframe2);
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte failed (error={e:?})");
+            drop(uframe2);
+            return false;
+        },
+    };
+    if before.flags().is_writable() {
+        error!("PTE is unexpectedly writable after mark_user_page_cow");
+        drop(uframe2);
+        return false;
+    }
+    if !before.is_cow() {
+        error!("PTE is missing CoW bit after mark_user_page_cow");
+        drop(uframe2);
+        return false;
+    }
+    let original_frame_number = before.frame_number().into_raw_value();
+
+    // Resolve the CoW mapping. This must allocate a new frame, copy the page contents, repoint
+    // the PTE, and drop the resolver's reference on the previously shared frame.
+    match parent.resolve_cow_at(vaddr) {
+        Ok(true) => {},
+        Ok(false) => {
+            error!("resolve_cow_at returned false on a CoW mapping");
+            drop(uframe2);
+            return false;
+        },
+        Err(e) => {
+            error!("resolve_cow_at failed (error={e:?})");
+            drop(uframe2);
+            return false;
+        },
+    };
+
+    // The PTE must now be writable, no longer CoW, and point at a different frame.
+    let after: PageTableEntry = match parent.try_find_user_pte(vaddr) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("PTE missing after resolve_cow_at");
+            drop(uframe2);
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte failed after resolve_cow_at (error={e:?})");
+            drop(uframe2);
+            return false;
+        },
+    };
+    if !after.flags().is_writable() {
+        error!("PTE is not writable after resolve_cow_at");
+        drop(uframe2);
+        return false;
+    }
+    if after.is_cow() {
+        error!("PTE still has CoW bit after resolve_cow_at");
+        drop(uframe2);
+        return false;
+    }
+    if after.frame_number().into_raw_value() == original_frame_number {
+        error!("PTE was not repointed at a new frame");
+        drop(uframe2);
+        return false;
+    }
+
+    // Drop the lingering shared handle: this must release the last reference to the original
+    // frame. If `resolve_cow_at` had failed to drop its own reference, refcount would still be
+    // 1 here and the underlying frame would leak — that would not crash the test but would
+    // show up as a frame-allocator inconsistency on subsequent runs.
+    drop(uframe2);
+
+    // Reclaim the private frame installed by `resolve_cow_at` before dropping `parent`. Dropping
+    // an address space frees only its page-table structures, not the user frames their entries
+    // map, so user frames must be reclaimed explicitly first — exactly as production does on the
+    // harvest/exit path. The debug assertion in `Vmem::drop` enforces that no user pages remain
+    // mapped at drop time.
+    if let Err(e) = parent.clear_user_space() {
+        error!("clear_user_space failed during test teardown (error={e:?})");
+        return false;
+    }
+    drop(parent);
+
+    true
+}
+
+///
+/// # Description
+///
+/// Exercises the fast path in [`Vmem::resolve_cow_at`]: when the resolving address space
+/// is the sole remaining owner of the shared frame (refcount == 1), the resolver must
+/// simply clear the copy-on-write mark in place — without allocating a new frame, copying
+/// any contents, or freeing the old frame.
+///
+/// Setup mirrors `test_cow_resolution_creates_private_frame` but drops the lingering
+/// shared handle *before* invoking `resolve_cow_at`, leaving refcount = 1.
+///
+/// Asserts that after the call the PTE is writable, no longer CoW, and still points at
+/// the *original* frame (proving no copy occurred).
+///
+fn test_cow_resolution_fast_path_when_sole_owner() -> bool {
+    const TEST_VADDR_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW;
+
+    let vaddr: PageAligned<VirtualAddress> =
+        match PageAligned::<VirtualAddress>::from_raw_value(TEST_VADDR_RAW) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("PageAligned::from_raw_value failed (error={e:?})");
+                return false;
+            },
+        };
+
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+    let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+
+    let mut parent: Vmem = match mm.new_vmem(pm.current_vmem()) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("new_vmem failed (error={e:?})");
+            return false;
+        },
+    };
+
+    let uframe1: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame failed (error={e:?})");
+            return false;
+        },
+    };
+    let uframe2: UserFrame = match uframe1.share() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("UserFrame::share failed (error={e:?})");
+            return false;
+        },
+    };
+
+    if let Err(e) = parent.map(uframe1, vaddr, AccessPermission::RDWR) {
+        error!("Vmem::map failed (error={e:?})");
+        drop(uframe2);
+        return false;
+    }
+
+    if let Err(e) = parent.mark_user_page_cow(vaddr) {
+        error!("mark_user_page_cow failed (error={e:?})");
+        drop(uframe2);
+        return false;
+    }
+
+    // Capture the original frame number, then drop the second handle so that the page
+    // table holds the only remaining reference (refcount == 1). This is the precondition
+    // for the fast path in `resolve_cow_at`.
+    let before: PageTableEntry = match parent.try_find_user_pte(vaddr) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("PTE missing after map + mark_user_page_cow");
+            drop(uframe2);
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte failed (error={e:?})");
+            drop(uframe2);
+            return false;
+        },
+    };
+    let original_frame_number = before.frame_number().into_raw_value();
+    drop(uframe2);
+
+    // Resolve the CoW mapping. The fast path must clear the CoW mark in place.
+    match parent.resolve_cow_at(vaddr) {
+        Ok(true) => {},
+        Ok(false) => {
+            error!("resolve_cow_at returned false on a CoW mapping");
+            return false;
+        },
+        Err(e) => {
+            error!("resolve_cow_at failed (error={e:?})");
+            return false;
+        },
+    };
+
+    // The PTE must now be writable, no longer CoW, and still point at the original frame
+    // (no copy was performed because refcount was already 1).
+    let after: PageTableEntry = match parent.try_find_user_pte(vaddr) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("PTE missing after resolve_cow_at");
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte failed after resolve_cow_at (error={e:?})");
+            return false;
+        },
+    };
+    if !after.flags().is_writable() {
+        error!("PTE is not writable after fast-path resolve_cow_at");
+        return false;
+    }
+    if after.is_cow() {
+        error!("PTE still has CoW bit after fast-path resolve_cow_at");
+        return false;
+    }
+    if after.frame_number().into_raw_value() != original_frame_number {
+        error!(
+            "fast path unexpectedly repointed PTE at a new frame (old={original_frame_number:#x}, \
+             new={:#x})",
+            after.frame_number().into_raw_value()
+        );
+        return false;
+    }
+
+    // Reclaim the user frame before dropping `parent`; see the teardown note in
+    // `test_cow_resolution_creates_private_frame`. The debug assertion in `Vmem::drop` requires
+    // that no user pages remain mapped at drop time.
+    if let Err(e) = parent.clear_user_space() {
+        error!("clear_user_space failed during test teardown (error={e:?})");
+        return false;
+    }
+    drop(parent);
+    true
+}
+
+///
+/// # Description
+///
+/// Verifies that explicit read-only control prevents CoW fault resolution for both shared
+/// and sole-owner mappings.
+///
+/// Creates real CoW mappings through [`VirtMemoryManager::link_user_pages`]. The parent is
+/// tested while the frame is shared, then cleared so the child becomes the sole owner.
+/// Both must retain their read-only mapping and original frame after a user-write fault is
+/// passed to [`VirtMemoryManager::try_resolve_cow_fault`].
+///
+fn test_readonly_control_revokes_cow() -> bool {
+    const TEST_VADDR_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW;
+    const USER_WRITE_PROTECTION_FAULT: PageFaultErrorCode = PageFaultErrorCode::new(0b111);
+
+    // SAFETY: pm/init() runs after the physical and virtual memory managers are initialized;
+    // access is synchronized because the kernel is single-threaded with interrupts disabled.
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+    let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+    let mut parent: Vmem = match mm.new_vmem(pm.current_vmem()) {
+        Ok(vmem) => vmem,
+        Err(e) => {
+            error!("new_vmem(parent) failed (error={e:?})");
+            return false;
+        },
+    };
+    let mut child: Vmem = match mm.new_vmem(pm.current_vmem()) {
+        Ok(vmem) => vmem,
+        Err(e) => {
+            error!("new_vmem(child) failed (error={e:?})");
+            return false;
+        },
+    };
+
+    let result: Result<bool, Error> = (|| {
+        let vaddr: PageAligned<VirtualAddress> = PageAligned::from_raw_value(TEST_VADDR_RAW)?;
+        // SAFETY: the initialized physical manager is accessed with interrupts disabled.
+        let frame: UserFrame = unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame()?;
+        let original_frame: usize = frame.address().into_frame_number().into_raw_value();
+        parent.map(frame, vaddr, AccessPermission::RDWR)?;
+        parent.memset(vaddr, 0)?;
+
+        // SAFETY: initialization is single-threaded and the shared manager borrow has ended.
+        let mm: &mut VirtMemoryManager = unsafe { VirtMemoryManager::get_mut() };
+        mm.link_user_pages(&mut parent, &mut child)?;
+
+        let mut passed: bool = true;
+        for (owner, vmem) in [("shared", &mut parent), ("sole", &mut child)] {
+            let before: PageTableEntry = match vmem.try_find_user_pte(vaddr)? {
+                Some(pte) => pte,
+                None => {
+                    error!("CoW mapping missing before revocation (owner={owner})");
+                    return Ok(false);
+                },
+            };
+            if !before.is_present()
+                || !before.flags().is_user()
+                || before.flags().is_writable()
+                || !before.is_cow()
+                || before.frame_number().into_raw_value() != original_frame
+            {
+                error!("invalid CoW mapping before revocation (owner={owner})");
+                return Ok(false);
+            }
+
+            mm.ctrl_upage(vmem, vaddr, AccessPermission::RDONLY)?;
+            let resolved: bool =
+                mm.try_resolve_cow_fault(vmem, TEST_VADDR_RAW, USER_WRITE_PROTECTION_FAULT)?;
+            let after: PageTableEntry = match vmem.try_find_user_pte(vaddr)? {
+                Some(pte) => pte,
+                None => {
+                    error!("mapping missing after revocation (owner={owner})");
+                    return Ok(false);
+                },
+            };
+            if resolved
+                || !after.is_present()
+                || !after.flags().is_user()
+                || after.flags().is_writable()
+                || after.is_cow()
+                || after.frame_number().into_raw_value() != original_frame
+            {
+                error!("write revocation failed (owner={owner}, resolved={resolved})");
+                passed = false;
+            }
+
+            // Releasing the parent mapping leaves the child on the sole-owner path.
+            vmem.clear_user_space()?;
+        }
+        Ok(passed)
+    })();
+
+    let mut passed: bool = match result {
+        Ok(passed) => passed,
+        Err(e) => {
+            error!("CoW revocation test failed (error={e:?})");
+            false
+        },
+    };
+
+    // Always reclaim mappings, including after setup or assertion failures.
+    for vmem in [&mut parent, &mut child] {
+        if let Err(e) = vmem.clear_user_space() {
+            error!("clear_user_space failed during test teardown (error={e:?})");
+            passed = false;
+        }
+    }
+    passed
+}
+
+/// Checks the actual x86_64 hardware mapping rather than the software bookkeeping PTE.
+#[cfg(target_arch = "x86_64")]
+fn check_user_hardware_mapping(
+    vmem: &Vmem,
+    vaddr: PageAligned<VirtualAddress>,
+    frame: usize,
+    writable: bool,
+) -> Result<bool, Error> {
+    let root: usize = vmem.cr3_value()?;
+    // SAFETY: these private test address spaces remain alive and mapped, and tests run with
+    // interrupts disabled. The query only reads their identity-mapped hardware page tables.
+    let actual: Option<(usize, bool)> = unsafe {
+        crate::hal::arch::x86::mem::mmu::hwpt::query_user_page(root as u64, vaddr.into_raw_value())
+    };
+    if actual != Some((frame, writable)) {
+        error!(
+            "hardware user mapping mismatch (root={root:#x}, vaddr={vaddr:?}, frame={frame:#x}, \
+             writable={writable}, actual={actual:?})"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+///
+/// # Description
+///
+/// Verifies that writable control preserves CoW while a frame is shared, including after
+/// explicit read-only control has cleared the CoW bit. Resolving the subsequent write fault
+/// must isolate the writer; the remaining sole owner may then become writable in place.
+/// On x86_64, also checks the actual hardware mapping through each permission transition.
+///
+#[inline(never)]
+fn test_writable_control_preserves_cow() -> bool {
+    const TEST_VADDR_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW;
+    const INITIAL_BYTE: u8 = 0x5a;
+    const WRITTEN_BYTE: u8 = 0xa5;
+    const USER_WRITE_PROTECTION_FAULT: PageFaultErrorCode = PageFaultErrorCode::new(0b111);
+
+    // SAFETY: the managers are initialized and initialization runs with interrupts disabled.
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+    let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+    let mut parent: Vmem = match mm.new_vmem(pm.current_vmem()) {
+        Ok(vmem) => vmem,
+        Err(e) => {
+            error!("new_vmem(parent) failed (error={e:?})");
+            return false;
+        },
+    };
+    let mut child: Vmem = match mm.new_vmem(pm.current_vmem()) {
+        Ok(vmem) => vmem,
+        Err(e) => {
+            error!("new_vmem(child) failed (error={e:?})");
+            return false;
+        },
+    };
+
+    let result: Result<bool, Error> = (|| {
+        let vaddr: PageAligned<VirtualAddress> = PageAligned::from_raw_value(TEST_VADDR_RAW)?;
+        // SAFETY: the initialized physical manager is accessed with interrupts disabled.
+        let frame: UserFrame = unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame()?;
+        let original_frame: FrameAddress = frame.address();
+        parent.map(frame, vaddr, AccessPermission::RDWR)?;
+        parent.memset(vaddr, u32::from(INITIAL_BYTE))?;
+        #[cfg(target_arch = "x86_64")]
+        if !check_user_hardware_mapping(&parent, vaddr, original_frame.into_raw_value(), true)? {
+            return Ok(false);
+        }
+
+        // Observe the mapped reference without acquiring or releasing an additional owner.
+        let probe: ManuallyDrop<UserFrame> = ManuallyDrop::new(UserFrame::new(original_frame));
+        // SAFETY: the previous shared manager borrow has ended; execution is single-threaded.
+        let mm: &mut VirtMemoryManager = unsafe { VirtMemoryManager::get_mut() };
+        mm.link_user_pages(&mut parent, &mut child)?;
+        let child_before: PageTableEntry = child
+            .try_find_user_pte(vaddr)?
+            .ok_or_else(|| Error::new(ErrorCode::NoSuchEntry, "child PTE missing after linking"))?;
+        if probe.refcount()? != 2
+            || child_before.flags().is_writable()
+            || !child_before.is_cow()
+            || child_before.frame_address() != original_frame.into_raw_value()
+        {
+            error!("invalid shared mapping before writable control");
+            return Ok(false);
+        }
+
+        let mut passed: bool = true;
+        for revoke_first in [false, true] {
+            if revoke_first {
+                mm.ctrl_upage(&mut parent, vaddr, AccessPermission::RDONLY)?;
+                #[cfg(target_arch = "x86_64")]
+                if !check_user_hardware_mapping(
+                    &parent,
+                    vaddr,
+                    original_frame.into_raw_value(),
+                    false,
+                )? {
+                    return Ok(false);
+                }
+            }
+            mm.ctrl_upage(&mut parent, vaddr, AccessPermission::RDWR)?;
+            let parent_pte: PageTableEntry = parent.try_find_user_pte(vaddr)?.ok_or_else(|| {
+                Error::new(ErrorCode::NoSuchEntry, "parent PTE missing after writable control")
+            })?;
+            let child_pte: PageTableEntry = child.try_find_user_pte(vaddr)?.ok_or_else(|| {
+                Error::new(ErrorCode::NoSuchEntry, "child PTE missing after writable control")
+            })?;
+            if !parent_pte.is_present()
+                || !parent_pte.flags().is_user()
+                || parent_pte.flags().is_writable()
+                || !parent_pte.is_cow()
+                || parent_pte.frame_address() != original_frame.into_raw_value()
+                || child_pte.into_raw_value() != child_before.into_raw_value()
+                || probe.refcount()? != 2
+            {
+                error!("shared writable control bypassed CoW (revoke_first={revoke_first})");
+                passed = false;
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                passed &= check_user_hardware_mapping(
+                    &parent,
+                    vaddr,
+                    original_frame.into_raw_value(),
+                    false,
+                )?;
+                passed &= check_user_hardware_mapping(
+                    &child,
+                    vaddr,
+                    original_frame.into_raw_value(),
+                    false,
+                )?;
+            }
+        }
+        if !passed {
+            return Ok(false);
+        }
+
+        if !mm.try_resolve_cow_fault(&mut parent, TEST_VADDR_RAW, USER_WRITE_PROTECTION_FAULT)? {
+            error!("write fault was not resolved after shared writable control");
+            return Ok(false);
+        }
+        let private_pte: PageTableEntry = parent.try_find_user_pte(vaddr)?.ok_or_else(|| {
+            Error::new(ErrorCode::NoSuchEntry, "parent PTE missing after CoW resolution")
+        })?;
+        if !private_pte.flags().is_writable()
+            || private_pte.is_cow()
+            || private_pte.frame_address() == original_frame.into_raw_value()
+            || probe.refcount()? != 1
+        {
+            error!("write fault did not create a private writable mapping");
+            return Ok(false);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !check_user_hardware_mapping(&parent, vaddr, private_pte.frame_address(), true)?
+            || !check_user_hardware_mapping(&child, vaddr, original_frame.into_raw_value(), false)?
+        {
+            return Ok(false);
+        }
+
+        let mut byte: u8 = 0;
+        let buffer: VirtualAddress = VirtualAddress::new(core::ptr::addr_of_mut!(byte) as usize);
+        parent.copy_from_user_unaligned(buffer, vaddr.into_inner(), 1)?;
+        if byte != INITIAL_BYTE {
+            error!("CoW resolution did not preserve the original contents");
+            return Ok(false);
+        }
+        parent.memset(vaddr, u32::from(WRITTEN_BYTE))?;
+        parent.copy_from_user_unaligned(buffer, vaddr.into_inner(), 1)?;
+        if byte != WRITTEN_BYTE {
+            error!("private write did not update the writer's contents");
+            return Ok(false);
+        }
+        child.copy_from_user_unaligned(buffer, vaddr.into_inner(), 1)?;
+        if byte != INITIAL_BYTE {
+            error!("private write changed the other owner's contents");
+            return Ok(false);
+        }
+
+        mm.ctrl_upage(&mut child, vaddr, AccessPermission::RDWR)?;
+        let exclusive_pte: PageTableEntry = child.try_find_user_pte(vaddr)?.ok_or_else(|| {
+            Error::new(ErrorCode::NoSuchEntry, "child PTE missing after exclusive writable control")
+        })?;
+        if !exclusive_pte.is_present()
+            || !exclusive_pte.flags().is_user()
+            || !exclusive_pte.flags().is_writable()
+            || exclusive_pte.is_cow()
+            || exclusive_pte.frame_address() != original_frame.into_raw_value()
+            || probe.refcount()? != 1
+        {
+            error!("exclusive writable control did not restore writes in place");
+            return Ok(false);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !check_user_hardware_mapping(&child, vaddr, original_frame.into_raw_value(), true)?
+            || !check_user_hardware_mapping(&parent, vaddr, private_pte.frame_address(), true)?
+        {
+            return Ok(false);
+        }
+        if mm.try_resolve_cow_fault(&mut child, TEST_VADDR_RAW, USER_WRITE_PROTECTION_FAULT)? {
+            error!("exclusive writable control retained CoW fault eligibility");
+            return Ok(false);
+        }
+
+        mm.ctrl_upage(&mut child, vaddr, AccessPermission::RDONLY)?;
+        let revoked_pte: PageTableEntry = child.try_find_user_pte(vaddr)?.ok_or_else(|| {
+            Error::new(ErrorCode::NoSuchEntry, "child PTE missing after revocation")
+        })?;
+        if revoked_pte.flags().is_writable()
+            || revoked_pte.is_cow()
+            || revoked_pte.frame_address() != original_frame.into_raw_value()
+        {
+            error!("exclusive revocation did not retain a read-only mapping");
+            return Ok(false);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !check_user_hardware_mapping(&child, vaddr, original_frame.into_raw_value(), false)?
+            || !check_user_hardware_mapping(&parent, vaddr, private_pte.frame_address(), true)?
+        {
+            return Ok(false);
+        }
+        if mm.try_resolve_cow_fault(&mut child, TEST_VADDR_RAW, USER_WRITE_PROTECTION_FAULT)? {
+            error!("exclusive revocation left CoW fault eligibility");
+            return Ok(false);
+        }
+        Ok(true)
+    })();
+
+    let mut passed: bool = match result {
+        Ok(passed) => passed,
+        Err(e) => {
+            error!("writable control test failed (error={e:?})");
+            false
+        },
+    };
+    for vmem in [&mut parent, &mut child] {
+        if let Err(e) = vmem.clear_user_space() {
+            error!("clear_user_space failed during test teardown (error={e:?})");
+            passed = false;
+        }
+    }
+    passed
+}
+
+//==================================================================================================
+// Standalone Functions
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Verifies that [`VirtMemoryManager::link_user_pages`] returns an error when `child`
+/// already contains a user mapping overlapping one of `parent`'s, instead of silently
+/// skipping the colliding address.
+///
+/// Setup:
+///
+/// - `parent` is given two consecutive writable user pages at `vaddr_a` and `vaddr_b`.
+/// - `child` is pre-populated with an independent user page at `vaddr_b`, so that
+///   address overlaps a `parent` mapping.
+///
+/// Expected post-conditions after the call returns `Err(ErrorCode::EntryExists)`:
+///
+/// - parent's `vaddr_a` PTE is untouched (writable, not CoW, original frame) because the
+///   overlap is detected before any page is linked.
+/// - parent's `vaddr_b` PTE is untouched (writable, not CoW, original frame).
+/// - `child` has no mapping at `vaddr_a` (nothing was linked).
+/// - `child`'s mapping at `vaddr_b` is unchanged (the pre-existing page is intact).
+///
+fn test_link_user_pages_errors_on_preexisting_child_overlap() -> bool {
+    const VADDR_A_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW;
+    const VADDR_B_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW + ::arch::mem::PAGE_SIZE;
+
+    let vaddr_a: PageAligned<VirtualAddress> =
+        match PageAligned::<VirtualAddress>::from_raw_value(VADDR_A_RAW) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("PageAligned::from_raw_value(vaddr_a) failed (error={e:?})");
+                return false;
+            },
+        };
+    let vaddr_b: PageAligned<VirtualAddress> =
+        match PageAligned::<VirtualAddress>::from_raw_value(VADDR_B_RAW) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("PageAligned::from_raw_value(vaddr_b) failed (error={e:?})");
+                return false;
+            },
+        };
+
+    // SAFETY: pm/init() runs after the physical and virtual memory managers are
+    // initialized; access is synchronized because the kernel is single-threaded with
+    // interrupts disabled.
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+
+    let mut parent: Vmem = {
+        let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+        match mm.new_vmem(pm.current_vmem()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("new_vmem(parent) failed (error={e:?})");
+                return false;
+            },
+        }
+    };
+    let mut child: Vmem = {
+        let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+        match mm.new_vmem(pm.current_vmem()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("new_vmem(child) failed (error={e:?})");
+                return false;
+            },
+        }
+    };
+
+    // Allocate three independent user frames.
+    let frame_a: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame(a) failed (error={e:?})");
+            return false;
+        },
+    };
+    let frame_b: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame(b) failed (error={e:?})");
+            return false;
+        },
+    };
+    let frame_c: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame(c) failed (error={e:?})");
+            return false;
+        },
+    };
+
+    let frame_a_num: usize = frame_a.address().into_frame_number().into_raw_value();
+    let frame_b_num: usize = frame_b.address().into_frame_number().into_raw_value();
+    let frame_c_num: usize = frame_c.address().into_frame_number().into_raw_value();
+
+    // Map parent's two writable user pages.
+    if let Err(e) = parent.map(frame_a, vaddr_a, AccessPermission::RDWR) {
+        error!("parent.map(vaddr_a) failed (error={e:?})");
+        return false;
+    }
+    if let Err(e) = parent.map(frame_b, vaddr_b, AccessPermission::RDWR) {
+        error!("parent.map(vaddr_b) failed (error={e:?})");
+        return false;
+    }
+
+    // Pre-map child at vaddr_b so it overlaps a parent mapping.
+    if let Err(e) = child.map(frame_c, vaddr_b, AccessPermission::RDWR) {
+        error!("child.map(vaddr_b) failed (error={e:?})");
+        return false;
+    }
+
+    // Invoke the routine under test. Must fail with `EntryExists`: the child already
+    // contains a user mapping overlapping the parent's at vaddr_b.
+    {
+        let mm_mut: &mut VirtMemoryManager = unsafe { VirtMemoryManager::get_mut() };
+        match mm_mut.link_user_pages(&mut parent, &mut child) {
+            Ok(()) => {
+                error!("link_user_pages unexpectedly succeeded on overlapping child");
+                return false;
+            },
+            Err(e) if e.code == ErrorCode::EntryExists => {},
+            Err(e) => {
+                error!("link_user_pages failed with unexpected error (error={e:?})");
+                return false;
+            },
+        }
+    }
+
+    // Parent's vaddr_a must be untouched: the overlap is detected before any linking.
+    let parent_a: PageTableEntry = match parent.try_find_user_pte(vaddr_a) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("parent PTE at vaddr_a missing after rejected link");
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte(parent, vaddr_a) failed (error={e:?})");
+            return false;
+        },
+    };
+    if !parent_a.flags().is_writable() {
+        error!("parent PTE at vaddr_a is not writable after rejected link");
+        return false;
+    }
+    if parent_a.is_cow() {
+        error!("parent PTE at vaddr_a unexpectedly carries CoW bit after rejected link");
+        return false;
+    }
+    if parent_a.frame_number().into_raw_value() != frame_a_num {
+        error!("parent PTE at vaddr_a points at the wrong frame after rejected link");
+        return false;
+    }
+
+    // Parent's vaddr_b must be untouched as well.
+    let parent_b: PageTableEntry = match parent.try_find_user_pte(vaddr_b) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("parent PTE at vaddr_b missing after rejected link");
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte(parent, vaddr_b) failed (error={e:?})");
+            return false;
+        },
+    };
+    if !parent_b.flags().is_writable() {
+        error!("parent PTE at vaddr_b is not writable after rejected link");
+        return false;
+    }
+    if parent_b.is_cow() {
+        error!("parent PTE at vaddr_b unexpectedly carries CoW bit");
+        return false;
+    }
+    if parent_b.frame_number().into_raw_value() != frame_b_num {
+        error!("parent PTE at vaddr_b points at the wrong frame");
+        return false;
+    }
+
+    // Child must have no mapping at vaddr_a: nothing was linked.
+    match child.is_user_page_mapped(vaddr_a) {
+        Ok(false) => {},
+        Ok(true) => {
+            error!("child unexpectedly has a mapping at vaddr_a after rejected link");
+            return false;
+        },
+        Err(e) => {
+            error!("child.is_user_page_mapped(vaddr_a) failed (error={e:?})");
+            return false;
+        },
+    }
+
+    // Child's pre-existing vaddr_b mapping must still point at frame_c.
+    let child_b: PageTableEntry = match child.try_find_user_pte(vaddr_b) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("child's pre-existing PTE at vaddr_b vanished");
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte(child, vaddr_b) failed (error={e:?})");
+            return false;
+        },
+    };
+    if child_b.frame_number().into_raw_value() != frame_c_num {
+        error!("child PTE at vaddr_b was overwritten (expected frame_c)");
+        return false;
+    }
+
+    // Reclaim the frames installed in both address spaces before dropping them; as in
+    // `test_cow_resolution_creates_private_frame`, dropping an address space frees only its
+    // page-table structures, not the user frames their entries map. The debug assertion in
+    // `Vmem::drop` requires that no user pages remain mapped at drop time.
+    if let Err(e) = parent.clear_user_space() {
+        error!("clear_user_space(parent) failed during test teardown (error={e:?})");
+        return false;
+    }
+    if let Err(e) = child.clear_user_space() {
+        error!("clear_user_space(child) failed during test teardown (error={e:?})");
+        return false;
+    }
+    drop(parent);
+    drop(child);
+
+    true
+}
+
+///
+/// # Description
+///
+/// Verifies that [`VirtMemoryManager::link_user_pages`] rolls back any pages it had
+/// already linked into `child` when a later iteration fails.
+///
+/// The failure is forced by saturating the reference count of `frame_b` to `u8::MAX`
+/// before invoking the routine. Iteration visits `vaddr_a` first (its page table entry
+/// is at a lower index) and links it into `child` as CoW. The second iteration then
+/// calls `share()` on `frame_b`, which overflows the refcount and returns
+/// `ErrorCode::OutOfMemory`. This triggers the rollback path.
+///
+/// Expected post-conditions after the call returns `Err`:
+///
+/// - parent's `vaddr_a` PTE is read-only and copy-on-write, still pointing at `frame_a`.
+///   The rollback deliberately leaves the parent's CoW mark in place because it cannot
+///   reliably tell a page it marked from one that was already shared copy-on-write before
+///   the call.
+/// - parent's `vaddr_b` PTE is untouched (writable, not CoW, original frame).
+/// - `child` has no mapping at either `vaddr_a` or `vaddr_b`.
+///
+fn test_link_user_pages_rolls_back_on_partial_failure() -> bool {
+    const VADDR_A_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW;
+    const VADDR_B_RAW: usize = ::config::memory_layout::USER_MMAP_BASE_RAW + ::arch::mem::PAGE_SIZE;
+
+    let vaddr_a: PageAligned<VirtualAddress> =
+        match PageAligned::<VirtualAddress>::from_raw_value(VADDR_A_RAW) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("PageAligned::from_raw_value(vaddr_a) failed (error={e:?})");
+                return false;
+            },
+        };
+    let vaddr_b: PageAligned<VirtualAddress> =
+        match PageAligned::<VirtualAddress>::from_raw_value(VADDR_B_RAW) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("PageAligned::from_raw_value(vaddr_b) failed (error={e:?})");
+                return false;
+            },
+        };
+
+    // SAFETY: pm/init() runs after the physical and virtual memory managers are
+    // initialized; access is synchronized because the kernel is single-threaded with
+    // interrupts disabled.
+    let pm: &ProcessManager = unsafe { ProcessManager::get() };
+
+    let mut parent: Vmem = {
+        let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+        match mm.new_vmem(pm.current_vmem()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("new_vmem(parent) failed (error={e:?})");
+                return false;
+            },
+        }
+    };
+    let mut child: Vmem = {
+        let mm: &VirtMemoryManager = unsafe { VirtMemoryManager::get() };
+        match mm.new_vmem(pm.current_vmem()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("new_vmem(child) failed (error={e:?})");
+                return false;
+            },
+        }
+    };
+
+    let frame_a: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame(a) failed (error={e:?})");
+            return false;
+        },
+    };
+    let frame_b: UserFrame = match unsafe { PhysMemoryManager::get_mut() }.alloc_user_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            error!("alloc_user_frame(b) failed (error={e:?})");
+            return false;
+        },
+    };
+
+    let frame_a_num: usize = frame_a.address().into_frame_number().into_raw_value();
+    let frame_b_num: usize = frame_b.address().into_frame_number().into_raw_value();
+
+    // Saturate frame_b's refcount so the next `share()` overflows. The fresh allocation
+    // starts at refcount 1, so 254 extra references reach u8::MAX. Each new handle is
+    // leaked to keep the bumped refcount in place; we never restore it (production
+    // processes release frames via the explicit harvest/unmap path, mirroring the
+    // disposition note on the CoW resolution tests).
+    for i in 0..254 {
+        match frame_b.share() {
+            Ok(handle) => {
+                handle.leak();
+            },
+            Err(e) => {
+                error!("frame_b.share() failed at iteration {i} (error={e:?})");
+                return false;
+            },
+        }
+    }
+    match frame_b.refcount() {
+        Ok(rc) if rc == u8::MAX => {},
+        Ok(rc) => {
+            error!("frame_b refcount is {rc} after saturation (expected {})", u8::MAX);
+            return false;
+        },
+        Err(e) => {
+            error!("frame_b.refcount() failed (error={e:?})");
+            return false;
+        },
+    }
+
+    if let Err(e) = parent.map(frame_a, vaddr_a, AccessPermission::RDWR) {
+        error!("parent.map(vaddr_a) failed (error={e:?})");
+        return false;
+    }
+    if let Err(e) = parent.map(frame_b, vaddr_b, AccessPermission::RDWR) {
+        error!("parent.map(vaddr_b) failed (error={e:?})");
+        return false;
+    }
+
+    // Invoke the routine under test. Must fail: vaddr_a is linked, then `share()`
+    // on frame_b overflows because its refcount is already u8::MAX.
+    {
+        let mm_mut: &mut VirtMemoryManager = unsafe { VirtMemoryManager::get_mut() };
+        match mm_mut.link_user_pages(&mut parent, &mut child) {
+            Ok(()) => {
+                error!("link_user_pages unexpectedly succeeded");
+                return false;
+            },
+            Err(e) if e.code == ErrorCode::OutOfMemory => {},
+            Err(e) => {
+                error!("link_user_pages failed with unexpected error (error={e:?})");
+                return false;
+            },
+        }
+    }
+
+    // Parent's vaddr_a: the child mapping is rolled back, but the parent's CoW mark is
+    // intentionally left in place, so it is read-only + CoW, still pointing at frame_a.
+    let parent_a: PageTableEntry = match parent.try_find_user_pte(vaddr_a) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("parent PTE at vaddr_a missing after rollback");
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte(parent, vaddr_a) failed (error={e:?})");
+            return false;
+        },
+    };
+    if parent_a.flags().is_writable() {
+        error!("parent PTE at vaddr_a is unexpectedly writable after rollback");
+        return false;
+    }
+    if !parent_a.is_cow() {
+        error!("parent PTE at vaddr_a lost its CoW bit after rollback");
+        return false;
+    }
+    if parent_a.frame_number().into_raw_value() != frame_a_num {
+        error!("parent PTE at vaddr_a points at the wrong frame after rollback");
+        return false;
+    }
+
+    // Parent's vaddr_b must be untouched.
+    let parent_b: PageTableEntry = match parent.try_find_user_pte(vaddr_b) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            error!("parent PTE at vaddr_b missing after rollback");
+            return false;
+        },
+        Err(e) => {
+            error!("try_find_user_pte(parent, vaddr_b) failed (error={e:?})");
+            return false;
+        },
+    };
+    if !parent_b.flags().is_writable() {
+        error!("parent PTE at vaddr_b is not writable after rollback");
+        return false;
+    }
+    if parent_b.is_cow() {
+        error!("parent PTE at vaddr_b unexpectedly carries CoW bit");
+        return false;
+    }
+    if parent_b.frame_number().into_raw_value() != frame_b_num {
+        error!("parent PTE at vaddr_b points at the wrong frame");
+        return false;
+    }
+
+    // Child must have no mappings: vaddr_a was rolled back; vaddr_b was never reached.
+    match child.is_user_page_mapped(vaddr_a) {
+        Ok(false) => {},
+        Ok(true) => {
+            error!("child still has a mapping at vaddr_a after rollback");
+            return false;
+        },
+        Err(e) => {
+            error!("child.is_user_page_mapped(vaddr_a) failed (error={e:?})");
+            return false;
+        },
+    }
+    match child.is_user_page_mapped(vaddr_b) {
+        Ok(false) => {},
+        Ok(true) => {
+            error!("child unexpectedly has a mapping at vaddr_b");
+            return false;
+        },
+        Err(e) => {
+            error!("child.is_user_page_mapped(vaddr_b) failed (error={e:?})");
+            return false;
+        },
+    }
+
+    // Reclaim the frames installed in both address spaces before dropping them (see the teardown
+    // note on `test_link_user_pages_errors_on_preexisting_child_overlap`). This releases each
+    // address space's own references; the 254 extra references on frame_b deliberately remain, so
+    // that frame stays allocated for the duration of the test. The debug assertion in `Vmem::drop`
+    // requires that no user pages remain mapped at drop time.
+    if let Err(e) = parent.clear_user_space() {
+        error!("clear_user_space(parent) failed during test teardown (error={e:?})");
+        return false;
+    }
+    if let Err(e) = child.clear_user_space() {
+        error!("clear_user_space(child) failed during test teardown (error={e:?})");
+        return false;
+    }
+    drop(parent);
+    drop(child);
+
+    true
+}
+
+/// Runs all process-management in-kernel tests.
+pub fn test() -> bool {
+    let mut passed: bool = true;
+    passed &= run_test!(test_mailbox_is_empty_tracks_buffered_messages);
+    passed &= run_test!(test_mailbox_purge_counts_removed_messages);
+    passed &= run_test!(test_mailbox_selects_oldest_eligible_message);
+    passed &= run_test!(test_event_guard_matching_follows_ownership_scope);
+    passed &= run_test!(test_kernel_process_has_no_special_resources);
+    passed &= run_test!(test_cow_resolution_creates_private_frame);
+    passed &= run_test!(test_cow_resolution_fast_path_when_sole_owner);
+    passed &= run_test!(test_readonly_control_revokes_cow);
+    passed &= run_test!(test_writable_control_preserves_cow);
+    passed &= run_test!(test_link_user_pages_errors_on_preexisting_child_overlap);
+    passed &= run_test!(test_link_user_pages_rolls_back_on_partial_failure);
+    passed &= super::process::test();
+    passed
+}

@@ -1,0 +1,85 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Crate Configuration
+//==================================================================================================
+
+// Attributes
+// Use no_std except during tests so the Rust test harness (which requires std) can run.
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+// Lints
+#![forbid(clippy::unwrap_used)]
+#![forbid(clippy::cast_possible_truncation)]
+#![forbid(clippy::cast_possible_wrap)]
+#![forbid(clippy::cast_precision_loss)]
+#![forbid(clippy::char_lit_as_u8)]
+#![forbid(clippy::fn_to_numeric_cast)]
+#![forbid(clippy::fn_to_numeric_cast_with_truncation)]
+#![forbid(clippy::ptr_as_ptr)]
+#![forbid(clippy::unnecessary_cast)]
+#![forbid(invalid_reference_casting)]
+#![forbid(clippy::panic)]
+#![forbid(clippy::unimplemented)]
+#![forbid(clippy::todo)]
+#![forbid(clippy::unreachable)]
+// The following lints are allowed in tests to facilitate testing of error conditions.
+#![cfg_attr(not(test), forbid(clippy::expect_used))]
+
+//==================================================================================================
+// Modules
+//==================================================================================================
+
+macro_rules! modules {
+    ($($module:ident),+ $(,)?) => {
+        $(pub mod $module;)+
+    };
+}
+
+modules!(killpg, raise, signal, sigpending, sigprocmask, sigset, sigsuspend);
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use ::sysapi::ffi::c_int;
+
+//==================================================================================================
+// Standalone Functions
+//==================================================================================================
+
+macro_rules! define_errno_helpers {
+    () => {
+        #[cfg(not(any(feature = "std", test)))]
+        use ::sysapi::errno::__errno_location;
+
+        ///
+        /// # Description
+        ///
+        /// Writes `code` to `errno`.
+        ///
+        /// # Parameters
+        ///
+        /// - `code`: Error code to be written to `errno`.
+        ///
+        #[cfg(not(any(feature = "std", test)))]
+        #[inline(always)]
+        fn set_errno(code: c_int) {
+            // SAFETY: `__errno_location()` returns a valid pointer to `errno`.
+            unsafe {
+                *__errno_location() = code;
+            }
+        }
+
+        /// Host-only stand-in for [`set_errno`] used by unit tests.
+        ///
+        /// The C `errno` location is not linkable into the host test binary, so this is a no-op.
+        /// The guest never compiles this variant; only the unit tests exercise it, and they assert
+        /// on return values rather than on `errno`.
+        #[cfg(any(feature = "std", test))]
+        #[inline(always)]
+        fn set_errno(_code: c_int) {}
+    };
+}
+
+define_errno_helpers!();

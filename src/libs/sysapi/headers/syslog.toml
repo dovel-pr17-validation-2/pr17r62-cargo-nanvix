@@ -1,0 +1,372 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for syslog.h.
+
+file = "syslog.h"
+brief = "System logging interface."
+description = '''
+Nanvix has no system log daemon in standalone mode, so these routines are
+no-ops; the definitions exist so that ports referencing them compile and link.'''
+guard = "_NANVIX_SYSLOG_H"
+scan_crates = ["nanvix_libc"]
+content_order = [
+    "rust_constants:options",
+    "rust_constants:facilities",
+    "rust_constants:priorities",
+    "raw:0",
+    "section:0",
+]
+
+[[rust_constants]]
+path = "syslog::LOG_PID"
+group = "options"
+section_title = "Options (openlog)"
+c_declaration = '''
+#define LOG_PID 0x01
+#define LOG_CONS 0x02
+#define LOG_ODELAY 0x04
+#define LOG_NDELAY 0x08
+#define LOG_NOWAIT 0x10
+#define LOG_PERROR 0x20'''
+no_comment = true
+
+[[rust_constants]]
+path = "syslog::LOG_CONS"
+group = "options"
+c_value = "0x02"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_ODELAY"
+group = "options"
+c_value = "0x04"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_NDELAY"
+group = "options"
+c_value = "0x08"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_NOWAIT"
+group = "options"
+c_value = "0x10"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_PERROR"
+group = "options"
+c_value = "0x20"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_KERN"
+group = "facilities"
+section_title = "Facilities"
+c_declaration = '''
+#define LOG_KERN (0 << 3)
+#define LOG_USER (1 << 3)
+#define LOG_MAIL (2 << 3)
+#define LOG_DAEMON (3 << 3)
+#define LOG_AUTH (4 << 3)
+#define LOG_SYSLOG (5 << 3)
+#define LOG_LPR (6 << 3)
+#define LOG_NEWS (7 << 3)
+#define LOG_UUCP (8 << 3)
+#define LOG_CRON (9 << 3)
+#define LOG_AUTHPRIV (10 << 3)
+#define LOG_FTP (11 << 3)
+#define LOG_LOCAL0 (16 << 3)
+#define LOG_LOCAL1 (17 << 3)
+#define LOG_LOCAL2 (18 << 3)
+#define LOG_LOCAL3 (19 << 3)
+#define LOG_LOCAL4 (20 << 3)
+#define LOG_LOCAL5 (21 << 3)
+#define LOG_LOCAL6 (22 << 3)
+#define LOG_LOCAL7 (23 << 3)
+
+#define LOG_NFACILITIES 24
+#define LOG_FACMASK 0x03f8
+#define LOG_FAC(p) (((p) & LOG_FACMASK) >> 3)'''
+no_comment = true
+
+[[rust_constants]]
+path = "syslog::LOG_USER"
+group = "facilities"
+c_value = "(1 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_MAIL"
+group = "facilities"
+c_value = "(2 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_DAEMON"
+group = "facilities"
+c_value = "(3 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_AUTH"
+group = "facilities"
+c_value = "(4 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_SYSLOG"
+group = "facilities"
+c_value = "(5 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LPR"
+group = "facilities"
+c_value = "(6 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_NEWS"
+group = "facilities"
+c_value = "(7 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_UUCP"
+group = "facilities"
+c_value = "(8 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_CRON"
+group = "facilities"
+c_value = "(9 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_AUTHPRIV"
+group = "facilities"
+c_value = "(10 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_FTP"
+group = "facilities"
+c_value = "(11 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL0"
+group = "facilities"
+c_value = "(16 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL1"
+group = "facilities"
+c_value = "(17 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL2"
+group = "facilities"
+c_value = "(18 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL3"
+group = "facilities"
+c_value = "(19 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL4"
+group = "facilities"
+c_value = "(20 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL5"
+group = "facilities"
+c_value = "(21 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL6"
+group = "facilities"
+c_value = "(22 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_LOCAL7"
+group = "facilities"
+c_value = "(23 << 3)"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_NFACILITIES"
+c_value = "24"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_FACMASK"
+group = "facilities"
+c_value = "0x03f8"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_EMERG"
+group = "priorities"
+section_title = "Priorities"
+c_declaration = '''
+#define LOG_EMERG 0
+#define LOG_ALERT 1
+#define LOG_CRIT 2
+#define LOG_ERR 3
+#define LOG_WARNING 4
+#define LOG_NOTICE 5
+#define LOG_INFO 6
+#define LOG_DEBUG 7
+
+#define LOG_PRIMASK 0x07
+#define LOG_PRI(p) ((p) & LOG_PRIMASK)
+#define LOG_MAKEPRI(fac, pri) ((fac) | (pri))
+
+#define LOG_MASK(pri) (1 << (pri))
+#define LOG_UPTO(pri) ((1 << ((pri) + 1)) - 1)'''
+no_comment = true
+
+[[rust_constants]]
+path = "syslog::LOG_ALERT"
+group = "priorities"
+c_value = "1"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_CRIT"
+group = "priorities"
+c_value = "2"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_ERR"
+group = "priorities"
+c_value = "3"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_WARNING"
+group = "priorities"
+c_value = "4"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_NOTICE"
+group = "priorities"
+c_value = "5"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_INFO"
+group = "priorities"
+c_value = "6"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_DEBUG"
+group = "priorities"
+c_value = "7"
+emit = false
+
+[[rust_constants]]
+path = "syslog::LOG_PRIMASK"
+group = "priorities"
+c_value = "0x07"
+emit = false
+
+[[rust_constants]]
+path = "syslog::INTERNAL_NOPRI"
+group = "syslog_names"
+c_value = "0x10"
+emit = false
+
+[[rust_constants]]
+path = "syslog::INTERNAL_MARK"
+group = "syslog_names"
+c_value = "(LOG_NFACILITIES << 3)"
+emit = false
+
+# Optional priority/facility name tables, defined only in a translation unit that
+# requests them via `#define SYSLOG_NAMES` (classic BSD <syslog.h> contract). The
+# arrays are real definitions, so exactly one TU per program may enable them.
+[[raw_sections]]
+title = "Priority and facility name tables (SYSLOG_NAMES)"
+text = '''
+#ifdef SYSLOG_NAMES
+#define INTERNAL_NOPRI 0x10
+#define INTERNAL_MARK (LOG_NFACILITIES << 3)
+
+typedef struct _code {
+    const char *c_name;
+    int c_val;
+} CODE;
+
+CODE prioritynames[] = {
+    { "alert", LOG_ALERT },
+    { "crit", LOG_CRIT },
+    { "debug", LOG_DEBUG },
+    { "emerg", LOG_EMERG },
+    { "err", LOG_ERR },
+    { "error", LOG_ERR },
+    { "info", LOG_INFO },
+    { "none", INTERNAL_NOPRI },
+    { "notice", LOG_NOTICE },
+    { "panic", LOG_EMERG },
+    { "warn", LOG_WARNING },
+    { "warning", LOG_WARNING },
+    { (const char *)0, -1 }
+};
+
+CODE facilitynames[] = {
+    { "auth", LOG_AUTH },
+    { "authpriv", LOG_AUTHPRIV },
+    { "cron", LOG_CRON },
+    { "daemon", LOG_DAEMON },
+    { "ftp", LOG_FTP },
+    { "kern", LOG_KERN },
+    { "lpr", LOG_LPR },
+    { "mail", LOG_MAIL },
+    { "mark", INTERNAL_MARK },
+    { "news", LOG_NEWS },
+    { "security", LOG_AUTH },
+    { "syslog", LOG_SYSLOG },
+    { "user", LOG_USER },
+    { "uucp", LOG_UUCP },
+    { "local0", LOG_LOCAL0 },
+    { "local1", LOG_LOCAL1 },
+    { "local2", LOG_LOCAL2 },
+    { "local3", LOG_LOCAL3 },
+    { "local4", LOG_LOCAL4 },
+    { "local5", LOG_LOCAL5 },
+    { "local6", LOG_LOCAL6 },
+    { "local7", LOG_LOCAL7 },
+    { (const char *)0, -1 }
+};
+#endif /* SYSLOG_NAMES */'''
+
+[[sections]]
+title = "Functions"
+functions = ["openlog", "closelog", "syslog", "setlogmask"]
+
+[overrides]
+openlog = '''
+extern void openlog(const char *ident, int option, int facility);'''
+closelog = '''
+extern void closelog(void);'''
+syslog = '''
+extern void syslog(int priority, const char *format, ...);'''
+setlogmask = '''
+extern int setlogmask(int mask);'''

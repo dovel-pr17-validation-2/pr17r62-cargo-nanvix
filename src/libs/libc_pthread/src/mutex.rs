@@ -1,0 +1,378 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use ::sys::{
+    error::ErrorCode,
+    time::SystemTime,
+};
+use ::sysapi::{
+    ffi::c_int,
+    pthread::pthread_mutex_type::{
+        PTHREAD_MUTEX_DEFAULT,
+        PTHREAD_MUTEX_ERRORCHECK,
+        PTHREAD_MUTEX_NORMAL,
+        PTHREAD_MUTEX_RECURSIVE,
+    },
+    sys_types::{
+        pthread_mutex_t,
+        pthread_mutexattr_t,
+    },
+    time::timespec,
+};
+use ::syscall::pthread;
+use ::syslog::trace_libcall;
+
+//==================================================================================================
+// pthread_mutexattr_init()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Initializes a mutex attributes object with default values.
+///
+/// # Parameters
+///
+/// - `attr`: Pointer to the mutex attributes object to be initialized.
+///
+/// # Returns
+///
+/// The `pthread_mutexattr_init()` function returns `0` on success. On error, it returns an error number.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+/// - `attr` points to a valid `pthread_mutexattr_t` object.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutexattr_init(attr: *mut pthread_mutexattr_t) -> c_int {
+    // Check if `attr` is not valid.
+    if attr.is_null() {
+        ::syslog::warn!("pthread_mutexattr_init(): invalid attr pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    *attr = pthread_mutexattr_t::default();
+    0
+}
+
+//==================================================================================================
+// pthread_mutexattr_destroy()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Destroys a mutex attributes object.
+///
+/// # Parameters
+///
+/// - `attr`: Pointer to the mutex attributes object to be destroyed.
+///
+/// # Returns
+///
+/// The `pthread_mutexattr_destroy()` function returns `0` on success. On error, it returns an error number.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+/// - `attr` points to a valid `pthread_mutexattr_t` object.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutexattr_destroy(attr: *mut pthread_mutexattr_t) -> c_int {
+    // Check if `attr` is not valid.
+    if attr.is_null() {
+        ::syslog::warn!("pthread_mutexattr_destroy(): invalid attr pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Check if the mutex attributes object is initialized.
+    if !(*attr).is_initialized() {
+        ::syslog::warn!("pthread_mutexattr_destroy(): attr is not initialized");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    (*attr).uninitialize();
+    0
+}
+
+//==================================================================================================
+// pthread_mutexattr_getpshared()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets the process-shared attribute from a mutex attributes object.
+///
+/// # Parameters
+///
+/// - `attr`: Pointer to the mutex attributes object.
+/// - `pshared`: Pointer where the process-shared attribute is stored on success.
+///
+/// # Returns
+///
+/// The `pthread_mutexattr_getpshared()` function returns `0` on success. On error, it returns an
+/// error number.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+/// - `attr` points to a valid `pthread_mutexattr_t` object.
+/// - `pshared` points to a valid `int` object.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutexattr_getpshared(
+    attr: *const pthread_mutexattr_t,
+    pshared: *mut c_int,
+) -> c_int {
+    // Check if `attr` is not valid.
+    if attr.is_null() {
+        ::syslog::warn!("pthread_mutexattr_getpshared(): invalid attr pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Check if `pshared` is not valid.
+    if pshared.is_null() {
+        ::syslog::warn!("pthread_mutexattr_getpshared(): invalid pshared pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Check if the mutex attributes object is initialized.
+    if !(*attr).is_initialized() {
+        ::syslog::warn!("pthread_mutexattr_getpshared(): attr is not initialized");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    *pshared = (*attr).pshared();
+    0
+}
+
+//==================================================================================================
+// pthread_mutexattr_settype()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Sets the mutex type attribute in a mutex attributes object.
+///
+/// # Parameters
+///
+/// - `attr`: Pointer to the mutex attributes object.
+/// - `type_`: Mutex type to set.
+///
+/// # Returns
+///
+/// The `pthread_mutexattr_settype()` function returns `0` on success. On error, it returns an error
+/// number.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+/// - `attr` points to a valid `pthread_mutexattr_t` object.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutexattr_settype(
+    attr: *mut pthread_mutexattr_t,
+    type_: c_int,
+) -> c_int {
+    // Check if `attr` is not valid.
+    if attr.is_null() {
+        ::syslog::warn!("pthread_mutexattr_settype(): invalid attr pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Check if `type_` is a supported mutex type.
+    match type_ {
+        PTHREAD_MUTEX_NORMAL
+        | PTHREAD_MUTEX_RECURSIVE
+        | PTHREAD_MUTEX_ERRORCHECK
+        | PTHREAD_MUTEX_DEFAULT => {
+            (*attr).set_type(type_);
+            0
+        },
+        _ => {
+            ::syslog::warn!("pthread_mutexattr_settype(): invalid mutex type (type={})", type_);
+            ErrorCode::InvalidArgument.get()
+        },
+    }
+}
+
+//==================================================================================================
+// pthread_mutexattr_gettype()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Gets the mutex type attribute from a mutex attributes object.
+///
+/// # Parameters
+///
+/// - `attr`: Pointer to the mutex attributes object.
+/// - `type_`: Pointer where the mutex type is stored on success.
+///
+/// # Returns
+///
+/// The `pthread_mutexattr_gettype()` function returns `0` on success. On error, it returns an error
+/// number.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+/// - `attr` points to a valid `pthread_mutexattr_t` object.
+/// - `type_` points to a valid `int` object.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutexattr_gettype(
+    attr: *const pthread_mutexattr_t,
+    type_: *mut c_int,
+) -> c_int {
+    // Check if `attr` is not valid.
+    if attr.is_null() {
+        ::syslog::warn!("pthread_mutexattr_gettype(): invalid attr pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Check if `type_` is not valid.
+    if type_.is_null() {
+        ::syslog::warn!("pthread_mutexattr_gettype(): invalid type pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    *type_ = (*attr).type_();
+    0
+}
+
+//==================================================================================================
+// pthread_mutex_timedlock()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Locks a mutex with a timeout.
+///
+/// # Parameters
+///
+/// - `mutex`: Mutex object.
+///
+/// # Returns
+///
+/// If successful, zero is returned. Otherwise, an error code is returned instead.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+///
+/// - `mutex` points to a valid `pthread_mutex_t` structure.
+/// - `abstime` points to a valid `timespec` structure.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutex_timedlock(
+    mutex: *mut pthread_mutex_t,
+    abstime: *const timespec,
+) -> c_int {
+    // Check if `mutex` is not valid.
+    if mutex.is_null() {
+        ::syslog::warn!("pthread_mutex_timedlock(): invalid mutex pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Check if `abstime` is not valid.
+    if abstime.is_null() {
+        ::syslog::warn!("pthread_mutex_timedlock(): invalid abstime pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Try to convert the `abstime`.
+    let timeout: SystemTime =
+        match SystemTime::new((*abstime).tv_sec as u64, (*abstime).tv_nsec as u32) {
+            Some(timeout) => timeout,
+            None => {
+                ::syslog::warn!(
+                    "pthread_mutex_timedlock(): invalid timeout (abstime={:?})",
+                    abstime
+                );
+                return ErrorCode::InvalidArgument.get();
+            },
+        };
+
+    match pthread::pthread_mutex_timedlock(&mut *mutex, Some(timeout)) {
+        Ok(_) => 0,
+        Err(error) => {
+            ::syslog::warn!(
+                "pthread_mutex_timedlock(): failed to lock mutex (abstime={:?}, error={:?})",
+                abstime,
+                error
+            );
+            error.code.get()
+        },
+    }
+}
+
+//==================================================================================================
+// pthread_mutex_trylock()
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Tries to lock a mutex.
+///
+/// # Parameters
+///
+/// - `mutex`: Mutex object.
+///
+/// # Returns
+///
+/// If successful, zero is returned. Otherwise, an error code is returned instead.
+///
+/// # Safety
+///
+/// This function is unsafe because it may dereference raw pointers.
+///
+/// It is safe to call this function if the following conditions are met:
+///
+/// - `mutex` points to a valid `pthread_mutex_t` structure.
+///
+#[unsafe(no_mangle)]
+#[trace_libcall]
+pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int {
+    // Check if `mutex` is not valid.
+    if mutex.is_null() {
+        ::syslog::warn!("pthread_mutex_trylock(): invalid mutex pointer");
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    match pthread::pthread_mutex_trylock(&mut *mutex) {
+        Ok(()) => 0,
+        Err(error) => {
+            ::syslog::warn!("pthread_mutex_trylock(): failed to lock mutex (error={:?})", error);
+            error.code.get()
+        },
+    }
+}

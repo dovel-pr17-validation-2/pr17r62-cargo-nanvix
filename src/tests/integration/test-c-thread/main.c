@@ -1,0 +1,187 @@
+/*
+ * Copyright(c) The Maintainers of Nanvix.
+ * Licensed under the MIT License.
+ */
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+#include "common.h"
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+//==================================================================================================
+// Macros
+//==================================================================================================
+
+/**
+ * @brief Performs a static assertion.
+ *
+ * @param a Expression to assert.
+ * @param b Expected value.
+ *
+ * @returns Nothing. If the assertion fails, compilation will fail.
+ */
+#define STATIC_ASSERT(a, b) ((void)sizeof(char[(((a) == (b)) ? 1 : -1)]))
+
+/**
+ * @brief Performs a static assertion on the size of a type.
+ *
+ * @param a Type to assert.
+ * @param b Expected size.
+ *
+ * @returns Nothing. If the assertion fails, compilation will fail.
+ */
+#define STATIC_ASSERT_SIZE(a, b) STATIC_ASSERT(sizeof(a), b)
+
+/**
+ * @brief Performs a static assertion on the alignment of a type.
+ *
+ * @param a Type to assert.
+ * @param b Expected alignment.
+ *
+ * @returns Nothing. If the assertion fails, compilation will fail.
+ */
+#define STATIC_ASSERT_ALIGNMENT(a, b) STATIC_ASSERT(_Alignof(a), b)
+
+//==================================================================================================
+// Standalone Functions
+//==================================================================================================
+
+/**
+ * @brief Tests pthreads system calls.
+ *
+ * @param argc Number of command-line arguments (unused).
+ * @param argv List of command-line arguments (unused).
+ *
+ * @returns Always returns zero. If a test fails, the program will abort.
+ */
+int main(int argc, const char *argv[])
+{
+    (void)argc;
+    (void)argv;
+
+    // Sanity check size of `pthread_t` type.
+    STATIC_ASSERT_SIZE(pthread_t, sizeof(uint32_t));
+
+    // Sanity check size of `pthread_key_t` type.
+    STATIC_ASSERT_SIZE(pthread_key_t, sizeof(uint32_t));
+
+    // Sanity check size of `pthread_attr_t` type.
+    //
+    // i386-ABI layout lock: on x86_64 the `void *`/`size_t` members carry 8-byte
+    // alignment, so the struct gains padding the member sum below does not model.
+    // Gate the lock to i386; the functional tests run on every target.
+#if defined(__i386__)
+    STATIC_ASSERT_SIZE(pthread_attr_t,
+                       sizeof(int) +                    // is_initialized
+                           sizeof(void *) +             // stackaddr
+                           sizeof(size_t) +             // stacksize
+                           sizeof(size_t) +             // guardsize
+                           sizeof(int) +                // contentionscope
+                           sizeof(int) +                // inheritsched
+                           sizeof(int) +                // schedpolicy
+                           sizeof(struct sched_param) + // schedparam
+                           sizeof(int) +                // cputime_clock_allowed
+                           sizeof(int)                  // detachstate
+
+    );
+#endif /* __i386__ */
+
+    // Sanity check size of `pthread_cond_t` type.
+    STATIC_ASSERT_SIZE(pthread_cond_t, sizeof(uint32_t));
+
+    // Sanity check size of `pthread_condattr_t` type.
+    //
+    // i386-ABI layout lock: `clock_t` (long long) aligns to 4 on i386 but to 8 on
+    // x86_64, so the struct gains padding after `is_initialized` on x86_64.
+#if defined(__i386__)
+    STATIC_ASSERT_SIZE(pthread_condattr_t,
+                       sizeof(int) +        // is_initialized
+                           sizeof(clock_t) + // clock
+                           sizeof(int)       // pshared
+    );
+#endif /* __i386__ */
+
+    // Sanity check size of `pthread_mutex_t` type.
+    STATIC_ASSERT_SIZE(pthread_mutex_t, sizeof(uint32_t));
+
+    // Sanity check size of `pthread_mutexattr_t` type.
+    STATIC_ASSERT_SIZE(pthread_mutexattr_t,
+                       sizeof(int) +     // is_initialized
+                           sizeof(int) + // type
+                           sizeof(int) + // recursive
+                           sizeof(int)   // pshared
+    );
+    STATIC_ASSERT_ALIGNMENT(pthread_mutexattr_t, _Alignof(int));
+
+    // Sanity check size of `pthread_rwlock_t` type.
+    STATIC_ASSERT_SIZE(pthread_rwlock_t, sizeof(uint32_t));
+
+    // Sanity check size of `pthread_rwlockattr_t` type.
+    STATIC_ASSERT_SIZE(pthread_rwlockattr_t,
+                       sizeof(int) +   // is_initialized
+                           sizeof(int) // pshared
+    );
+    STATIC_ASSERT_ALIGNMENT(pthread_rwlockattr_t, _Alignof(int));
+
+    // Sanity check size of `sem_t` type.
+    STATIC_ASSERT_SIZE(sem_t,
+                       sizeof(int) +                    // count
+                           sizeof(pthread_mutex_t) +    // lock
+                           sizeof(pthread_cond_t)       // cond
+    );
+
+    test_pthread_self();
+    test_pthread_setcancelstate();
+    test_pthread_setcanceltype();
+    test_pthread_testcancel();
+    test_pthread_cleanup();
+    test_pthread_attr_init_destroy();
+    test_pthread_attr_setdetachstate();
+    test_pthread_attr_getguardsize();
+    test_pthread_attr_setguardsize();
+    test_pthread_attr_setschedparam();
+    test_pthread_attr_getstack();
+    test_pthread_attr_setstack();
+    test_pthread_attr_setstacksize();
+    test_pthread_getattr_np_destroy();
+    test_pthread_getschedparam();
+    test_pthread_create_join();
+    test_pthread_mutex_static_init();
+    test_pthread_mutex_dynamic_init();
+    test_pthread_mutexattr_settype();
+    test_pthread_mutexattr_getpshared();
+    test_pthread_mutexattr_setpshared();
+    test_pthread_mutexattr_destroy();
+    test_pthread_mutex_trylock();
+    test_pthread_mutex_timedlock();
+    test_pthread_condattr_init();
+    test_pthread_condattr_destroy();
+    test_pthread_condattr_getclock();
+    test_pthread_condattr_getpshared();
+    test_pthread_condattr_setpshared();
+    test_pthread_rwlock_static_init();
+    test_pthread_rwlock_dynamic_init();
+    test_pthread_rwlockattr_init();
+    test_pthread_rwlockattr_destroy();
+    test_pthread_rwlockattr_getpshared();
+    test_pthread_rwlockattr_setpshared();
+    test_pthread_rwlock_init_attr();
+    test_pthread_cond_static_init();
+    test_pthread_cond_timedwait();
+    test_pthread_tda();
+    test_thread_local();
+    test_semaphore();
+
+    // Must be last test.
+    test_pthread_nowait();
+
+    // Write magic string to signal that the test passed.
+    write(STDOUT_FILENO, "ok", 2);
+
+    return (0);
+}

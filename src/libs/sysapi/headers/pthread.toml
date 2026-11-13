@@ -1,0 +1,217 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for pthread.h.
+
+file = "pthread.h"
+brief = "Threads."
+description = '''
+Declares the POSIX threads constants and attribute types. The scalar thread
+identifiers are declared in <sys/types.h>; the layouts mirror the Rust
+definitions in the sysapi crate (pthread.rs, sys_types.rs).'''
+includes = ["sched.h", "sys/types.h", "time.h"]
+guard = "_NANVIX_PTHREAD_H"
+scan_crates = ["libc_pthread", "syscall"]
+content_order = [
+    "rust_constants",
+    "rust_types",
+    "raw:0",
+    "section:0",
+    "section:1",
+    "section:2",
+    "section:3",
+    "section:4",
+    "section:5",
+]
+
+[[rust_constants]]
+path = "pthread::pthread_mutex_type::PTHREAD_MUTEX_NORMAL"
+comment = "Mutex that does not detect deadlock."
+
+[[rust_constants]]
+path = "pthread::pthread_mutex_type::PTHREAD_MUTEX_RECURSIVE"
+comment = "Mutex that allows recursive locking."
+
+[[rust_constants]]
+path = "pthread::pthread_mutex_type::PTHREAD_MUTEX_ERRORCHECK"
+comment = "Mutex that provides error checking."
+
+[[rust_constants]]
+path = "pthread::pthread_mutex_type::PTHREAD_MUTEX_DEFAULT"
+comment = "Default mutex type."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_MUTEX_INITIALIZER"
+comment = "Static mutex initializer."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_COND_INITIALIZER"
+comment = "Static condition variable initializer."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_RWLOCK_INITIALIZER"
+comment = "Static read-write lock initializer."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_NULL"
+comment = "Null thread identifier."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_CREATE_JOINABLE"
+comment = "Thread is created joinable."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_CREATE_DETACHED"
+comment = "Thread is created detached."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_CANCEL_ENABLE"
+comment = "Thread cancellation is enabled."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_CANCEL_DISABLE"
+comment = "Thread cancellation is disabled."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_CANCEL_DEFERRED"
+comment = "Thread cancellation is deferred."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_CANCEL_ASYNCHRONOUS"
+comment = "Thread cancellation is asynchronous."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_PROCESS_PRIVATE"
+comment = "Synchronization object is private to a process."
+
+[[rust_constants]]
+path = "pthread::PTHREAD_PROCESS_SHARED"
+comment = "Synchronization object is shared between processes."
+
+[[rust_types]]
+path = "sys_types::pthread_attr_t"
+
+[[rust_types]]
+path = "sys_types::pthread_condattr_t"
+
+[[rust_types]]
+path = "sys_types::pthread_mutexattr_t"
+field_renames = { type_ = "type" }
+packed = false
+
+[[rust_types]]
+path = "sys_types::pthread_rwlockattr_t"
+packed = false
+
+[[rust_types]]
+path = "sys_types::pthread_once_t"
+packed = false
+
+[[raw_sections]]
+c_only_reason = "C aggregate initializer for static pthread_once_t storage."
+text = '''
+/** @brief Static initializer for a pthread_once_t control variable. */
+#define PTHREAD_ONCE_INIT                                                                          \
+    {                                                                                              \
+        1, 0                                                                                       \
+    }'''
+
+[[sections]]
+title = "Threads"
+functions = [
+    "_pthread_cleanup_pop",
+    "_pthread_cleanup_push",
+    "pthread_create",
+    "pthread_join",
+    "pthread_detach",
+    "pthread_kill",
+    "pthread_exit",
+    "pthread_self",
+    "pthread_equal",
+    "pthread_getschedparam",
+    "pthread_setcancelstate",
+    "pthread_setcanceltype",
+    "pthread_testcancel",
+]
+
+[[sections]]
+title = "Thread Attributes"
+functions = [
+    "pthread_attr_init",
+    "pthread_attr_destroy",
+    "pthread_attr_getdetachstate",
+    "pthread_attr_getguardsize",
+    "pthread_attr_setguardsize",
+    "pthread_attr_setdetachstate",
+    "pthread_attr_getschedparam",
+    "pthread_attr_setschedparam",
+    "pthread_attr_getstack",
+    "pthread_attr_setstack",
+    "pthread_attr_getstacksize",
+    "pthread_attr_setstacksize",
+    "pthread_attr_getstackaddr",
+    "pthread_attr_setstackaddr",
+    "pthread_getattr_np",
+]
+
+[[sections]]
+title = "Mutexes"
+functions = [
+    "pthread_mutex_init",
+    "pthread_mutex_destroy",
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "pthread_mutex_trylock",
+    "pthread_mutex_timedlock",
+    "pthread_mutexattr_init",
+    "pthread_mutexattr_destroy",
+    "pthread_mutexattr_getpshared",
+    "pthread_mutexattr_setpshared",
+    "pthread_mutexattr_settype",
+    "pthread_mutexattr_gettype",
+]
+
+[[sections]]
+title = "Condition Variables"
+functions = [
+    "pthread_cond_init",
+    "pthread_cond_destroy",
+    "pthread_cond_signal",
+    "pthread_cond_broadcast",
+    "pthread_cond_wait",
+    "pthread_cond_timedwait",
+    "pthread_condattr_destroy",
+    "pthread_condattr_init",
+    "pthread_condattr_getclock",
+    "pthread_condattr_getpshared",
+    "pthread_condattr_setclock",
+    "pthread_condattr_setpshared",
+]
+
+[[sections]]
+title = "Read-Write Locks"
+functions = [
+    "pthread_rwlock_init",
+    "pthread_rwlock_destroy",
+    "pthread_rwlock_rdlock",
+    "pthread_rwlock_wrlock",
+    "pthread_rwlock_unlock",
+    "pthread_rwlockattr_init",
+    "pthread_rwlockattr_destroy",
+    "pthread_rwlockattr_getpshared",
+    "pthread_rwlockattr_setpshared",
+]
+
+[[sections]]
+title = "Thread-Specific Data"
+functions = [
+    "pthread_key_create",
+    "pthread_key_delete",
+    "pthread_getspecific",
+    "pthread_setspecific",
+    "pthread_once",
+]
+
+[overrides]
+pthread_create = '''
+extern int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);'''

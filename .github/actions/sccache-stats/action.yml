@@ -1,0 +1,23 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "SCCACHE Statistics"
+description: "Dump SCCACHE statistics if available"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Dump SCCACHE Statistics"
+      shell: bash
+      run: |
+        if [[ -n "${SCCACHE:-}" ]] && [[ -x "${SCCACHE}" ]]; then
+          sccache_bin="${SCCACHE}"
+        else
+          sccache_bin="$(command -v sccache 2>/dev/null || true)"
+        fi
+        if [[ -n "${sccache_bin}" ]] && [[ -x "${sccache_bin}" ]]; then
+          echo "SCCACHE Statistics:"
+          "${sccache_bin}" --show-stats || echo "Failed to retrieve sccache statistics"
+        else
+          echo "SCCACHE not configured or not available"
+        fi

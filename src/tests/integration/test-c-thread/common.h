@@ -1,0 +1,135 @@
+/*
+ * Copyright(c) The Maintainers of Nanvix.
+ * Licensed under the MIT License.
+ */
+
+#ifndef _COMMON_H_
+#define _COMMON_H_
+
+// Tests if threads can get their own identifiers.
+extern void test_pthread_self(void);
+
+// Tests if a thread can create a cancellation point when no cancellation request is pending.
+extern void test_pthread_testcancel(void);
+
+// Tests if the cancellation state of the calling thread can be changed.
+extern void test_pthread_setcancelstate(void);
+
+// Tests if the cancellation type of the calling thread can be changed.
+extern void test_pthread_setcanceltype(void);
+
+// Tests if cancellation cleanup handlers can be pushed and popped.
+extern void test_pthread_cleanup(void);
+
+// Tests if `pthread_mutex_cond_timedwait()` can be used for synchronization.
+extern void test_pthread_cond_timedwait(void);
+
+// Tests if threads can be created and joined.
+extern void test_pthread_create_join(void);
+
+// Tests if statically initialized mutexes can be used for synchronization.
+extern void test_pthread_mutex_static_init(void);
+
+// Tests if dynamically initialized mutexes can be used for synchronization.
+extern void test_pthread_mutex_dynamic_init(void);
+
+// Tests if condition variable attributes can be initialized.
+extern void test_pthread_condattr_init(void);
+
+// Tests if condition variable attributes can be destroyed.
+extern void test_pthread_condattr_destroy(void);
+
+// Tests if the clock attribute can be retrieved.
+extern void test_pthread_condattr_getclock(void);
+
+// Tests if the process-sharing attribute can be retrieved.
+extern void test_pthread_condattr_getpshared(void);
+
+// Tests if the process-sharing attribute can be set and retrieved.
+extern void test_pthread_condattr_setpshared(void);
+
+// Tests if calling exit() causes the program to exit even if there are other threads running.
+extern void test_pthread_nowait(void);
+
+// Tests if statically initialized condition variables can be used for synchronization.
+extern void test_pthread_cond_static_init(void);
+
+// Tests if thread interface for operating on thread-specific data works.
+extern void test_pthread_tda(void);
+
+// Tests if calling `test_pthread_mutex_timedlock() works.
+extern void test_pthread_mutex_timedlock(void);
+
+// Tests if calling `pthread_mutex_trylock() works.
+extern void test_pthread_mutex_trylock(void);
+
+// Tests if thread local storage works.
+extern void test_thread_local(void);
+
+// Tests if pthread attributes can be initialized and destroyed.
+extern void test_pthread_attr_init_destroy(void);
+
+// Tests if the detach state attribute can be set and retrieved.
+extern void test_pthread_attr_setdetachstate(void);
+
+// Tests if the guard size attribute can be retrieved.
+extern void test_pthread_attr_getguardsize(void);
+
+// Tests if the guard size attribute can be set and retrieved.
+extern void test_pthread_attr_setguardsize(void);
+
+// Tests if scheduling parameters can be set and retrieved.
+extern void test_pthread_attr_setschedparam(void);
+
+// Tests if the mutex type attribute can be set and retrieved.
+extern void test_pthread_mutexattr_settype(void);
+
+// Tests if the process-sharing attribute can be retrieved.
+extern void test_pthread_mutexattr_getpshared(void);
+
+// Tests if the process-sharing attribute can be set and retrieved.
+extern void test_pthread_mutexattr_setpshared(void);
+
+// Tests if mutex attributes can be destroyed.
+extern void test_pthread_mutexattr_destroy(void);
+
+// Tests if pthread_getattr_np() can retrieve attributes and they can be destroyed.
+extern void test_pthread_getattr_np_destroy(void);
+
+// Tests if the scheduling policy and parameters of a thread can be retrieved.
+extern void test_pthread_getschedparam(void);
+
+// Tests if pthread_attr_getstack() can retrieve stack attributes and they can be destroyed.
+extern void test_pthread_attr_getstack(void);
+
+// Tests if pthread_attr_setstack() validates and stores stack attributes.
+extern void test_pthread_attr_setstack(void);
+
+// Tests if pthread_attr_setstacksize() validates, stores, and applies the stack size attribute.
+extern void test_pthread_attr_setstacksize(void);
+
+// Tests if statically initialized read-write locks can synchronize multiple readers.
+extern void test_pthread_rwlock_static_init(void);
+
+// Tests if dynamically initialized read-write locks work (init/destroy + exclusion semantics).
+extern void test_pthread_rwlock_dynamic_init(void);
+
+// Tests if read-write lock attributes can be initialized.
+extern void test_pthread_rwlockattr_init(void);
+
+// Tests if read-write lock attributes can be destroyed.
+extern void test_pthread_rwlockattr_destroy(void);
+
+// Tests if the process-sharing attribute of read-write lock attributes can be retrieved.
+extern void test_pthread_rwlockattr_getpshared(void);
+
+// Tests if the process-sharing attribute of read-write lock attributes can be set and retrieved.
+extern void test_pthread_rwlockattr_setpshared(void);
+
+// Tests if read-write locks can be initialized with an attributes object.
+extern void test_pthread_rwlock_init_attr(void);
+
+// Tests if unnamed POSIX semaphores can be used for synchronization.
+extern void test_semaphore(void);
+
+#endif

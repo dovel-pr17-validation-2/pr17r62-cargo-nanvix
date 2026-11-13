@@ -1,0 +1,151 @@
+#==================================================================================================
+# Kernel Build-Time Configuration
+#==================================================================================================
+#
+# This file defines the build-time constants for the Nanvix kernel. Values are consumed by:
+#   - src/libs/config/build.rs  (generates Rust constants for the config crate)
+#   - src/kernel/build.rs       (passes values to the linker script and assembly)
+#
+# Both build scripts validate these values at build time. Invalid configurations will cause a build
+# failure with a descriptive assertion message.
+#
+#==================================================================================================
+
+#==================================================================================================
+# Memory Layout
+#==================================================================================================
+
+# Number of processors.
+num_processors = 1
+
+# Kernel watermark (in frames).
+# User-side allocations are rejected when fulfilling them would leave fewer than this many free
+# frames in the system. Kernel allocations are never gated by this watermark.
+# Constraints:
+# - Must be non-zero.
+# - Recommended: 32-64 frames (128-256 KB), sized to cover worst-case kernel cleanup operations.
+kernel_watermark = 64
+
+#==================================================================================================
+# Stack Configuration
+#==================================================================================================
+
+# Kernel stack size (in bytes).
+# Constraints:
+# - Must be a multiple of the page size.
+# - Must be at least two pages (one guard page + one usable page).
+# - Must not exceed the size of a page table.
+kstack_size = 65536
+
+# Kernel stack guard watermark pattern (repeated 32-bit word).
+# The bottom page of each kernel stack is filled with this pattern at boot. If a stack overflow
+# corrupts the guard page, the pattern mismatch is detected at runtime.
+# Constraints:
+# - Must fit in a 32-bit word.
+kstack_guard_pattern = 0xDEAD1234
+
+# Kernel red zone size (in bytes).
+# The red zone is a small memory area used for inter-processor communication during AP startup.
+# Constraints
+# - Must be a multiple of the word size (4 bytes on x86-32).
+kredzone_size = 128
+
+#==================================================================================================
+# Scheduling and Timing
+#==================================================================================================
+
+# Timer frequency (in Hz).
+# Lower values reduce KVM VM-exit overhead from timer interrupts.
+# 1000 Hz provides 1ms resolution with ~10x fewer VM exits than 10 kHz.
+timer_freq = 1000
+
+# Scheduler frequency (in ticks).
+# At 1000 Hz timer, 50 ticks = 50ms preemption quantum.
+scheduler_freq = 50
+
+#==================================================================================================
+# Inter-Kernel / Inter-Process Communication
+#==================================================================================================
+
+# Maximum number of messages that can be buffered by the kernel.
+# Notes:
+# - When this threshold is reached, inter-kernel communication is blocked.
+# - This value should be set according to the amount of memory available in the kernel heap.
+max_ikc_messages = 128
+
+# Size of an IPC message (in bytes).
+# Notes:
+# - The value of this function has direct impact on IPC performance.
+# - The default value is set to match the size of a cache line in x86 processors.
+ipc_message_size = 64
+
+# Number of IKC messages to poll at a time.
+ikc_poll_batch_size = 8
+
+#==================================================================================================
+# Kernel Heap
+#==================================================================================================
+
+# Maximum allocation size (in bytes) served by the kernel heap's slab allocator.
+# Allocations whose size or alignment exceed this value are rejected. Components outside the kernel
+# (such as the scatter/gather IKC limits in the `sys` crate) size their buffers against this budget.
+# Constraints:
+# - Must be a power of two.
+# - Must match the largest slab tier in `src/kernel/src/mm/kheap.rs` (currently 512). The
+#   compile-time assertion in that module fails the build if the two ever diverge.
+max_slab_size = 2048
+
+#==================================================================================================
+# Thread Limits
+#==================================================================================================
+
+# Maximum number of threads that may exist system-wide at the same time (including the kernel
+# thread). When this limit is reached, create_thread and create_process return OutOfMemory instead
+# of proceeding with allocations that could exhaust the kernel heap.
+# A thread slot is considered occupied from creation until the zombie is joined or harvested.
+# Constraints:
+# - Must be at least 1 (the kernel thread always exists).
+# Notes:
+# - Each thread consumes at least one kernel stack (kstack_size bytes). At the default kstack_size
+#   of 64 KiB, 32 threads imply up to ~2 MiB of kernel-stack reservation.
+max_threads = 32
+
+# Maximum number of processes that may exist system-wide at the same time.
+# A process slot is considered occupied from creation until the zombie is buried (i.e. waited on).
+# Constraints:
+# - Must be at least 1 (the kernel process always exists).
+# - Must not exceed 255. This upper bound lets the kernel encode per-frame reference counts in a
+#   single byte (a frame can be shared by at most max_processes owners), which keeps the
+#   BSS-backed refcount table small.
+max_processes = 255
+
+#==================================================================================================
+# Synchronization Limits
+#==================================================================================================
+
+# Maximum number of mutexes a process may hold at the same time.
+# Notes:
+# - This number was arbitrarily chosen.
+mutex_open_max = 32
+
+# Maximum number of condition variables a process may hold at the same time.
+# Notes:
+# - This number was arbitrarily chosen.
+cond_open_max = 32
+
+#==================================================================================================
+# Debug
+#==================================================================================================
+
+# Maximum size (in bytes) of a single debug message buffer.
+# Notes:
+# - This value must be smaller than a page.
+# - The kernel debug handler truncates messages larger than this limit: it writes their leading
+#   part, cut at a character boundary, followed by a truncation marker.
+debug_buffer_size = 256
+
+# Size (in bytes) of the kernel log buffer.
+# Notes:
+# - All kernel log output is buffered here before being flushed in bulk.
+# - Set to 0 to disable all kernel logging.
+klog_buffer_size = 4096

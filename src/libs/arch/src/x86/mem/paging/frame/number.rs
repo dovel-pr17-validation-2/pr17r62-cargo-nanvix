@@ -1,0 +1,151 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+include!("number.spec.rs");
+
+#[cfg(verus_keep_ghost)]
+include!("number.proof.rs");
+
+use crate::mem;
+use ::sys::mm::{
+    Address,
+    PhysicalAddress,
+    VirtualAddress,
+};
+
+//==================================================================================================
+// Structures
+//==================================================================================================
+
+///
+/// # Description
+///
+/// A type that represents a frame number.
+/// A frame number is in the range from `0` to [`Self::MAX`] (inclusive).
+///
+#[verus_verify]
+#[derive(Debug, Clone, Copy)]
+pub struct FrameNumber(usize);
+
+//==================================================================================================
+// Implementations
+//==================================================================================================
+
+#[verus_verify]
+impl FrameNumber {
+    /// The maximum frame number.
+    ///
+    /// This is the number of the highest frame whose entire extent fits within the addressable
+    /// space `[0, MAX_ADDRESS]`. A frame `f` spans the byte range
+    /// `[f * FRAME_SIZE, (f + 1) * FRAME_SIZE - 1]`, so the last fully-addressable frame is
+    /// `(MAX_ADDRESS + 1) / FRAME_SIZE - 1`. That expression is rewritten below to avoid
+    /// overflowing `usize` when `MAX_ADDRESS == usize::MAX`:
+    ///
+    /// - If `MAX_ADDRESS` is the last byte of its frame (`MAX_ADDRESS % FRAME_SIZE ==
+    ///   FRAME_SIZE - 1`), that top frame is wholly addressable and is therefore the maximum.
+    /// - Otherwise the top frame is only partially addressable, so the preceding frame is the
+    ///   maximum.
+    pub const MAX: usize = if mem::MAX_ADDRESS % mem::FRAME_SIZE == mem::FRAME_SIZE - 1 {
+        mem::MAX_ADDRESS / mem::FRAME_SIZE
+    } else {
+        mem::MAX_ADDRESS / mem::FRAME_SIZE - 1
+    };
+
+    #[verus_spec(ensures Self::NULL@ == 0)]
+    pub const NULL: Self = Self(0);
+
+    ///
+    /// # Description
+    ///
+    /// Constructs a [`FrameNumber`].
+    ///
+    /// # Parameters
+    ///
+    /// - `value`: The value of the frame number.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(`[`FrameNumber`]`)`: Upon success.
+    /// - `None`: If the value is greater than [`Self::MAX`].
+    ///
+    #[verus_spec(result =>
+        ensures
+            value as int <= Self::spec_max() ==> (result matches Some(v)
+                && v@ == value as int),
+            value as int > Self::spec_max() ==> result is None,
+    )]
+    pub fn from_raw_value(value: usize) -> Option<Self> {
+        if value > Self::MAX {
+            return None;
+        }
+
+        Some(Self(value))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Converts a [`FrameNumber`] into a raw value.
+    ///
+    /// # Returns
+    ///
+    /// The raw value of the target [`FrameNumber`].
+    ///
+    #[verus_spec(result =>
+        ensures
+            result as int == self@,
+            0 <= self@ <= Self::spec_max(),
+    )]
+    pub fn into_raw_value(self) -> usize {
+        proof! { use_type_invariant(self); }
+        self.0
+    }
+}
+
+#[verus_verify]
+impl From<FrameNumber> for PhysicalAddress {
+    #[verus_verify(external_body)]
+    #[verus_spec(result =>
+        ensures
+            result@ == frame_number@ * (mem::FRAME_SIZE as int),
+    )]
+    fn from(frame_number: FrameNumber) -> Self {
+        let raw_addr: usize = frame_number.into_raw_value() * mem::FRAME_SIZE;
+        // SAFETY: frame-number conversions intentionally bypass the RAM-only physical-address
+        // validator. Page-table entries may refer to MMIO frames, such as the LAPIC page near the
+        // top of the u32 address space.
+        unsafe { PhysicalAddress::from_mmio_address(VirtualAddress::from_raw_value(raw_addr)) }
+    }
+}
+
+#[verus_verify]
+impl From<PhysicalAddress> for FrameNumber {
+    #[verus_spec(result =>
+        ensures
+            result@ == phys_addr@ / (mem::FRAME_SIZE as int),
+    )]
+    fn from(phys_addr: PhysicalAddress) -> Self {
+        let raw_addr: usize = phys_addr.into_raw_value();
+        let frame_number: usize = raw_addr >> mem::FRAME_SHIFT;
+        proof! {
+            FrameNumber::lemma_raw_shr_frame_shift(raw_addr);
+        }
+        // The unwrap below never panics: `FrameNumber::MAX` is the number of the frame that
+        // contains `MAX_ADDRESS`, so `raw_addr >> FRAME_SHIFT <= FrameNumber::MAX` holds for
+        // every address in the space.
+        FrameNumber::from_raw_value(frame_number).unwrap()
+    }
+}
+
+//==================================================================================================
+// Unit Tests
+//==================================================================================================
+
+#[cfg(test)]
+mod tests;

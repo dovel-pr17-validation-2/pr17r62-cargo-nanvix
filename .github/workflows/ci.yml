@@ -1,0 +1,2128 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Nanvix CI/CD"
+
+on:
+  schedule:
+    # Publish release artifacts for the latest version nightly at midnight UTC.
+    - cron: "0 0 * * *"
+
+  # Dispatched by manual-release.yml after it pushes the version bump to dev.
+  workflow_dispatch:
+
+  pull_request:
+    types:
+      - "opened"
+      - "synchronize"
+      - "reopened"
+      - "ready_for_review"
+    branches:
+      - "dev"
+
+  merge_group:
+    types:
+      - "checks_requested"
+
+  push:
+    branches:
+      - "dev"
+    # Benchmark baselines are pushed back to dev by benchmark-persist. Ignore
+    # them here so those commits only wake up deploy-bench, not the full
+    # pipeline.
+    paths-ignore:
+      - "www/bench/data/**"
+
+# Cancel previous running actions for the same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
+
+# Disable Cargo incremental compilation across every CI job. CI runners start
+# from an empty target/ directory on each run, so incremental compilation gives
+# no benefit and actively defeats sccache, which refuses to cache incremental
+# builds. Forcing it off (overriding the dev profile's incremental = true) makes
+# debug compilations cacheable and raises the sccache hit rate.
+env:
+  CARGO_INCREMENTAL: 0
+
+# Build-type strategy:
+#   pull_request      → debug only   (fast feedback during development)
+#   merge_group       → release only (final validation before landing on dev)
+#   push (dev)        → release only (CI pipeline only, no release publish)
+#   schedule          → release only (nightly release archives & publish pipeline)
+#   workflow_dispatch → both          (full coverage for manual runs)
+#
+# Documentation-only pull requests skip builds, tests, and benchmarks (see the
+# 'changes' job).
+
+jobs:
+  # ==========================================================================================
+  # Pre-check
+  # ==========================================================================================
+
+  precheck:
+    # The merge queue already ensures the branch is up-to-date, so skip this
+    # check for merge_group events to avoid false negatives from the merge
+    # commit detection in the reusable workflow. Scheduled runs have no PR
+    # context, so skip them as well.
+    if: github.event_name != 'merge_group' && github.event_name != 'schedule'
+    uses: nanvix/nanvix/.github/workflows/branch-up-to-date.yml@dev
+    secrets: inherit
+
+  # Check whether self-hosted runners are online so that benchmark jobs can be
+  # gracefully skipped when no runners are available instead of queuing
+  # indefinitely.  See .github/actions/check-runners/action.yml for details.
+  check-runners:
+    name: "Check Self-Hosted Runners"
+    if: github.repository == 'nanvix/nanvix'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      benchmark-linux: ${{ steps.check-linux.outputs.available }}
+      benchmark-windows: ${{ steps.check-windows.outputs.available }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Check Linux Runners"
+        id: check-linux
+        uses: ./.github/actions/check-runners
+        with:
+          github-token: ${{ secrets.RUNNER_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+          os: "Linux"
+          runner-name-prefix: "prometheus"
+          runner-label: "benchmark"
+
+      - name: "Check Windows Runners"
+        id: check-windows
+        uses: ./.github/actions/check-runners
+        with:
+          github-token: ${{ secrets.RUNNER_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+          os: "Windows"
+          runner-name-prefix: "WIN"
+          runner-label: "benchmark"
+
+  # Detect pull requests that only change documentation (Markdown files and
+  # anything under doc/). Builds, tests, and benchmarks are skipped for them,
+  # while source checks (format, spellcheck), lint, and verify still run. Every
+  # other event reports docs-only=false and runs the full pipeline.
+  changes:
+    name: "Detect Changes"
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+    steps:
+      # The test-merge commit and its parents suffice to diff the pull request
+      # against its base branch.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+
+      - name: "Classify Changed Files"
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # The root README.md is not documentation-only: it is copied into the
+          # guest root file system images that the integration tests read.
+          is_documentation() {
+            case "$1" in
+              README.md) return 1 ;;
+              doc/* | *.md) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          docs_only=false
+          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+            echo "Not a pull request: running the full pipeline."
+          elif ! git rev-parse --quiet --verify "HEAD^2" > /dev/null; then
+            echo "HEAD is not a test-merge commit: running the full pipeline."
+          else
+            # The first parent of the test-merge commit is the base branch, so
+            # this lists exactly the files that the pull request changes. Rename
+            # detection is disabled so that both paths of a rename are checked.
+            changed_files="${RUNNER_TEMP}/changed-files"
+            git diff --name-only --no-renames -z "HEAD^1" HEAD > "${changed_files}"
+
+            # File names come from the pull request: do not let the runner
+            # parse them as workflow commands while they are logged.
+            stop_token="$(uuidgen)"
+            echo "::stop-commands::${stop_token}"
+            count=0
+            non_docs=0
+            while IFS= read -r -d '' file; do
+              count=$((count + 1))
+              if is_documentation "${file}"; then
+                echo "  documentation: ${file}"
+              else
+                echo "  other:         ${file}"
+                non_docs=$((non_docs + 1))
+              fi
+            done < "${changed_files}"
+            echo "::${stop_token}::"
+
+            if [[ "${count}" -eq 0 ]]; then
+              echo "No changed files found: running the full pipeline."
+            elif [[ "${non_docs}" -gt 0 ]]; then
+              echo "${non_docs} of ${count} changed file(s) are not documentation: running the full pipeline."
+            else
+              echo "All ${count} changed file(s) are documentation: skipping builds, tests, and benchmarks."
+              docs_only=true
+            fi
+          fi
+          echo "Decision: docs-only=${docs_only}"
+          echo "docs-only=${docs_only}" >> "${GITHUB_OUTPUT}"
+
+  # ==========================================================================================
+  # Benchmark Eligibility Gates
+  # ==========================================================================================
+  #
+  # Aggregate every condition that determines whether a benchmark pipeline
+  # (build → finalize → release) should run for a given platform into a single
+  # boolean output (`should-run`). Downstream jobs depend on the relevant gate
+  # and consume `needs.<gate>.outputs.should-run == 'true'` instead of
+  # re-evaluating the same conditions in each `if:` expression. This guarantees
+  # that benchmark, benchmark-finalize, and release-archive jobs are skipped
+  # consistently when no self-hosted runners are available.
+
+  benchmark-gate-linux:
+    name: "Benchmark Gate (Linux)"
+    needs: [ precheck, check-runners, changes ]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      should-run: ${{ steps.gate.outputs.should-run }}
+    steps:
+      - id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUNNERS_AVAILABLE: ${{ needs.check-runners.outputs.benchmark-linux }}
+          UP_TO_DATE: ${{ needs.precheck.outputs.up_to_date }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs-only }}
+        run: |
+          set -euo pipefail
+          should_run=false
+          if [[ "${REPO}" != "nanvix/nanvix" ]]; then
+            echo "Skip: repository is not nanvix/nanvix"
+          elif [[ "${DOCS_ONLY}" == "true" ]]; then
+            echo "Skip: only documentation changed"
+          elif [[ "${RUNNERS_AVAILABLE}" != "true" ]]; then
+            # Fail closed: treat empty / unknown values (e.g. check-runners
+            # was skipped or failed) as unavailable to prevent benchmark jobs
+            # from queuing indefinitely.
+            echo "Skip: Linux self-hosted benchmark runners unavailable (status='${RUNNERS_AVAILABLE}')"
+          elif [[ "${EVENT_NAME}" == "merge_group" || "${EVENT_NAME}" == "schedule" ]]; then
+            should_run=true
+          elif [[ "${UP_TO_DATE}" == "true" ]]; then
+            if [[ "${EVENT_NAME}" == "push" && "${HEAD_COMMIT_MSG}" == "Merge "* ]]; then
+              echo "Skip: push event on a merge commit"
+            elif [[ "${EVENT_NAME}" == "pull_request" ]]; then
+              if [[ "${IS_DRAFT}" == "true" ]]; then
+                echo "Skip: draft pull request"
+              elif [[ "${PR_HEAD_REPO}" != "${REPO}" ]]; then
+                # Fork PRs are excluded from Linux benchmarks to prevent
+                # untrusted code from running on self-hosted runners.
+                echo "Skip: pull request from a fork"
+              else
+                should_run=true
+              fi
+            else
+              should_run=true
+            fi
+          else
+            echo "Skip: branch is not up to date with dev"
+          fi
+          echo "Decision: should-run=${should_run}"
+          echo "should-run=${should_run}" >> "${GITHUB_OUTPUT}"
+
+  benchmark-gate-windows:
+    name: "Benchmark Gate (Windows)"
+    needs: [ precheck, check-runners, changes ]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      should-run: ${{ steps.gate.outputs.should-run }}
+    steps:
+      - id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUNNERS_AVAILABLE: ${{ needs.check-runners.outputs.benchmark-windows }}
+          UP_TO_DATE: ${{ needs.precheck.outputs.up_to_date }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs-only }}
+        run: |
+          set -euo pipefail
+          should_run=false
+          if [[ "${REPO}" != "nanvix/nanvix" ]]; then
+            echo "Skip: repository is not nanvix/nanvix"
+          elif [[ "${DOCS_ONLY}" == "true" ]]; then
+            echo "Skip: only documentation changed"
+          elif [[ "${RUNNERS_AVAILABLE}" != "true" ]]; then
+            # Fail closed: treat empty / unknown values (e.g. check-runners
+            # was skipped or failed) as unavailable to prevent benchmark jobs
+            # from queuing indefinitely.
+            echo "Skip: Windows self-hosted benchmark runners unavailable (status='${RUNNERS_AVAILABLE}')"
+          elif [[ "${EVENT_NAME}" == "merge_group" || "${EVENT_NAME}" == "schedule" ]]; then
+            should_run=true
+          elif [[ "${UP_TO_DATE}" == "true" ]]; then
+            if [[ "${EVENT_NAME}" == "push" && "${HEAD_COMMIT_MSG}" == "Merge "* ]]; then
+              echo "Skip: push event on a merge commit"
+            elif [[ "${EVENT_NAME}" == "pull_request" ]]; then
+              if [[ "${IS_DRAFT}" == "true" ]]; then
+                echo "Skip: draft pull request"
+              elif [[ "${PR_HEAD_REPO}" != "${REPO}" ]]; then
+                # Fork PRs are excluded from Windows benchmarks to prevent
+                # untrusted code from running on self-hosted runners.
+                echo "Skip: pull request from a fork"
+              else
+                should_run=true
+              fi
+            else
+              should_run=true
+            fi
+          else
+            echo "Skip: branch is not up to date with dev"
+          fi
+          echo "Decision: should-run=${should_run}"
+          echo "should-run=${should_run}" >> "${GITHUB_OUTPUT}"
+
+  # ==========================================================================================
+  # Stage 1: Source Checks (GitHub-Hosted Runners)
+  # ==========================================================================================
+
+  # Run config-independent source checks once (format, spellcheck) instead of
+  # repeating them in every matrix entry. Downstream jobs (ci-build)
+  # wait for these to pass.
+  checks:
+    name: "Source Checks"
+    needs: precheck
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nanvix/ci:ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+
+    # Only run the CI for:
+    # - Merge queue validation runs.
+    # - Nightly scheduled runs.
+    # - Non-merge pushes to 'dev'.
+    # - Non-draft PRs.
+    # NOTE: !cancelled() overrides the implicit success() status check so that
+    # the job is not transitively skipped when precheck is skipped
+    # (schedule / merge_group events). See actions/runner#2205.
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Setup"
+        uses: ./.github/actions/native-setup
+        with:
+          components: "rustfmt"
+
+      - name: "Check Code Format"
+        shell: bash
+        run: |
+          ./z build -- format-check
+
+      - name: "Spellcheck"
+        shell: bash
+        run: |
+          ./z build -- spellcheck
+
+      - name: "Check Test Layout"
+        shell: bash
+        run: |
+          ./z build -- test-layout-check
+
+  # ==========================================================================================
+  # Stage 1 (parallel): Config-Dependent Source Checks (GitHub-Hosted Runners)
+  # ==========================================================================================
+
+  # Lint and verify run in parallel with config-independent checks (format,
+  # spellcheck) since they are independent source checks that only need
+  # precheck. ci-build waits for all of them (checks + lint + verify) to pass.
+  #
+  # Lint is machine-dependent but does NOT depend on build-type (debug vs release). Run lint once
+  # per machine instead of once per build matrix entry.
+  lint:
+    name: "Lint (${{ matrix.target-arch }}, ${{ matrix.machine-type }})"
+    needs: [ precheck ]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nanvix/ci:ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Setup"
+        uses: ./.github/actions/native-setup
+        with:
+          components: "clippy"
+
+      - name: "Lint"
+        shell: bash
+        run: |
+          ./z build -- lint-check \
+            "MACHINE=${{ matrix.machine-type }}" \
+            TARGET=${{ matrix.target-arch }} \
+            LOG_LEVEL=trace \
+            VERBOSE=yes \
+            BUILD_OPT=no
+
+  # Verus formal verification is machine-dependent and runs once per machine, like lint.
+  verify:
+    name: "Verify (${{ matrix.machine-type }})"
+    needs: [ precheck ]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        machine-type: [ microvm ]
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nanvix/ci:ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Setup"
+        uses: ./.github/actions/native-setup
+
+      - name: "Verify"
+        uses: ./.github/actions/verify
+        with:
+          machine-type: ${{ matrix.machine-type }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Each matrix entry builds on a GitHub-hosted runner. Integration tests run
+  # in a separate ci-test job (typically on self-hosted runners) that depends
+  # on the completion of the entire ci-build matrix, so tests start only after
+  # all builds have finished rather than as soon as an individual build
+  # completes.
+  ci-build:
+    name: "Build (${{ matrix.build-type }}, ${{ matrix.target-arch }}, ${{
+      matrix.machine-type }}, ${{
+      matrix.memory-size }}mb)"
+    needs: [ precheck, changes, checks, lint, verify ]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # PRs run debug AND release (so release-gated integration tests run on
+        # PRs too); merge queue and dev pushes run release only (final validation
+        # + release archives); manual dispatch runs both.
+        build-type: ${{ fromJSON(github.event_name == 'pull_request' && '["debug","release"]' ||
+          github.event_name == 'workflow_dispatch' && '["debug","release"]' ||
+          '["release"]') }}
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+        memory-size: [ 256 ]
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nanvix/ci:ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      # Grant cache write access so the actions/cache save step (and the
+      # sccache GHA backend) can persist entries across runs.
+      actions: write
+
+    env:
+      # Opt into sccache's GitHub Actions cache backend. The sccache-action only
+      # installs sccache and exports the cache-service URL/token (plus
+      # ACTIONS_CACHE_SERVICE_V2); it does NOT set this flag. Without it sccache
+      # silently falls back to a local on-disk cache that is discarded with the
+      # ephemeral container every run, yielding a permanent ~0% hit rate.
+      SCCACHE_GHA_ENABLED: "true"
+
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    # !failure() ensures the build does not start when checks/lint/verify fail.
+    # Documentation-only pull requests skip the build and, transitively, the
+    # tests that consume its artifacts.
+    if: |
+      !cancelled() && !failure() &&
+      github.repository == 'nanvix/nanvix' &&
+      needs.changes.outputs.docs-only != 'true' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Setup"
+        uses: ./.github/actions/native-setup
+
+      - name: "Setup sccache"
+        uses: Mozilla-Actions/sccache-action@v0.0.11
+        with:
+          version: "v0.10.0"
+
+      # Start the sccache server ahead of the build, so that transient cache-service errors are
+      # retried instead of failing the first compilation.
+      - name: "Start sccache Server"
+        uses: ./.github/actions/sccache-start
+
+      # Cache the Cargo registry index, downloaded crate archives (.crate
+      # files), and git dependency database so dependency resolution and crate
+      # downloads are not repeated on every run. The extracted sources under
+      # registry/src and the git/checkouts working copies are intentionally
+      # omitted: Cargo regenerates them locally from the cached archives and
+      # git/db, so caching them would only bloat the entry without saving any
+      # network round-trips. Keyed on Cargo.lock; the machine-type is folded
+      # into the key so concurrent matrix legs do not race on the same entry.
+      # sccache (above) handles compilation caching; this complements it by
+      # avoiding redundant network fetches and registry rebuilds.
+      - name: "Cache Cargo Registry"
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ matrix.machine-type }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.machine-type }}-
+            cargo-${{ runner.os }}-
+
+      - name: "Build & Unit Test"
+        shell: bash
+        env:
+          MACHINE_TYPE: ${{ matrix.machine-type }}
+          LOG_LEVEL: ${{ matrix.build-type == 'release' && 'error' || 'trace' }}
+          RELEASE_FLAG: ${{ matrix.build-type == 'release' && 'RELEASE=yes' || '' }}
+          BUILD_TARGETS: ${{ matrix.build-type == 'release' && 'all run-unit-tests
+            stage-dlfcn-test-rootfs release' || 'all run-unit-tests
+            stage-dlfcn-test-rootfs' }}
+        run: |
+          ./z build -- ${BUILD_TARGETS} \
+            "MACHINE=${MACHINE_TYPE}" \
+            TARGET=${{ matrix.target-arch }} \
+            "LOG_LEVEL=${LOG_LEVEL}" \
+            VERBOSE=yes \
+            BUILD_OPT=yes \
+            ${RELEASE_FLAG} \
+            "MEMORY_SIZE=${{ matrix.memory-size }}"
+
+      - name: "Upload Build Artifacts"
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-build-${{ matrix.build-type }}-${{ matrix.target-arch }}-${{
+            matrix.machine-type }}-${{
+            matrix.memory-size }}mb
+          overwrite: true
+          retention-days: 1
+          path: |
+            bin/
+            lib/
+            sysroot-${{ matrix.build-type }}/
+            nanvix-*.tar.bz2
+
+      - name: "Upload logs in case of failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-ci-logs-${{ github.event.pull_request.number || github.run_number
+            }}-${{ matrix.build-type }}-${{ matrix.target-arch }}-${{
+            matrix.machine-type }}-${{ matrix.memory-size }}mb
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+
+  ci-test:
+    name: "Test (${{ matrix.build-type }}, ${{ matrix.target-arch }}, ${{
+      matrix.machine-type }}, shard ${{
+      matrix.shard }}/4)"
+    needs: [ ci-build ]
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: ${{ !cancelled() && needs.ci-build.result == 'success' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ${{ fromJSON(github.event_name == 'pull_request' && '["debug","release"]' ||
+          github.event_name == 'workflow_dispatch' && '["debug","release"]' ||
+          '["release"]') }}
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+        # The TOML-driven integration suites are partitioned into disjoint shards
+        # that run on independent runners. The harness selects this shard's tests
+        # via `-shard INDEX/TOTAL` (round-robin), so tests added to the TOML
+        # configs are distributed automatically with no workflow changes. To
+        # change the shard count, update this list AND the `shard-total` input
+        # passed to the integration-test action below so they stay in sync.
+        shard: [ 1, 2, 3, 4 ]
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nanvix/ci:ubuntu-24.04
+      options: --privileged
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # The CI container runs as root without USER set; nanvixd uses it as
+      # fallback tenant-id and fails when the variable is missing.
+      USER: root
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Setup"
+        uses: ./.github/actions/native-setup
+
+      - name: "Setup KVM"
+        uses: ./.github/actions/setup-kvm
+
+      - name: "Prepare Test Artifacts"
+        uses: ./.github/actions/prepare-test-artifacts
+        with:
+          build-type: "${{ matrix.build-type }}"
+          machine-type: "${{ matrix.machine-type }}"
+          target: "${{ matrix.target-arch }}"
+
+      - name: "Integration Test"
+        uses: ./.github/actions/integration-test
+        with:
+          build-type: "${{ matrix.build-type }}"
+          machine-type: "${{ matrix.machine-type }}"
+          target: "${{ matrix.target-arch }}"
+          shard-index: "${{ matrix.shard }}"
+          shard-total: "4"
+
+      - name: "Upload logs in case of failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-integration-logs-${{ github.event.pull_request.number ||
+            github.run_number }}-${{ matrix.build-type }}-${{ matrix.target-arch
+            }}-${{ matrix.machine-type }}-shard${{ matrix.shard }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+
+  # Non-sharded integration checks that should run once per configuration rather
+  # than per shard: in-kernel unit tests, the boot smoke test, and the shim
+  # integration test. Kept in a dedicated job so the sharded ci-test runners
+  # execute only disjoint slices of the TOML suites.
+  ci-test-extras:
+    name: "Test Extras (${{ matrix.build-type }}, ${{ matrix.target-arch }}, ${{
+      matrix.machine-type }})"
+    needs: [ ci-build ]
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: ${{ !cancelled() && needs.ci-build.result == 'success' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ${{ fromJSON(github.event_name == 'pull_request' && '["debug","release"]' ||
+          github.event_name == 'workflow_dispatch' && '["debug","release"]' ||
+          '["release"]') }}
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nanvix/ci:ubuntu-24.04
+      options: --privileged
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # The CI container runs as root without USER set; nanvixd uses it as
+      # fallback tenant-id and fails when the variable is missing.
+      USER: root
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Setup"
+        uses: ./.github/actions/native-setup
+
+      - name: "Setup KVM"
+        uses: ./.github/actions/setup-kvm
+
+      - name: "Prepare Test Artifacts"
+        uses: ./.github/actions/prepare-test-artifacts
+        with:
+          build-type: "${{ matrix.build-type }}"
+          machine-type: "${{ matrix.machine-type }}"
+          target: "${{ matrix.target-arch }}"
+
+      - name: "In-Kernel & Smoke Tests"
+        uses: ./.github/actions/integration-test-extras
+        with:
+          build-type: "${{ matrix.build-type }}"
+          machine-type: "${{ matrix.machine-type }}"
+          target: "${{ matrix.target-arch }}"
+
+      - name: "Shim Integration Test"
+        # The containerd shim is host-side and architecture-independent; run it
+        # once (under x86) to avoid duplicating a slow, guest-booting test.
+        if: matrix.target-arch == 'x86'
+        shell: bash
+        env:
+          NANVIX_DIR: ${{ github.workspace }}
+        run: |
+          set -Eeuo pipefail
+          echo "Running shim integration tests with NANVIX_DIR=${NANVIX_DIR}"
+          cargo test --locked --no-default-features \
+            -p containerd-shim-nanvix-v1 --test integration -- --nocapture --test-threads=1
+
+      - name: "Upload logs in case of failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-integration-extras-logs-${{ github.event.pull_request.number ||
+            github.run_number }}-${{ matrix.build-type }}-${{ matrix.target-arch
+            }}-${{ matrix.machine-type }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+
+
+  # ==========================================================================================
+  # Windows CI (GitHub-Hosted Runners)
+  # ==========================================================================================
+
+  # Format check is machine-type independent, so it runs once.
+  windows-format-check:
+    name: "Windows Format Check"
+    needs: [ precheck ]
+    timeout-minutes: 30
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Install Rust Toolchain"
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain | Select-String '^channel\s*=').ToString() -replace '.*=\s*"([^"]+)".*','$1'
+          rustup toolchain install $toolchain
+          rustup show
+          rustup component add --toolchain $toolchain rustfmt
+
+      - name: "Check Code Format"
+        shell: pwsh
+        run: |
+          .\z.ps1 build -- format-check
+
+      - name: "Check Test Layout"
+        shell: pwsh
+        run: |
+          .\z.ps1 build -- test-layout-check
+
+  # Lint check varies by target architecture and machine type.
+  windows-lint-check:
+    name: "Windows Lint Check (${{ matrix.target-arch }}, ${{ matrix.machine-type }})"
+    needs: [ precheck ]
+    timeout-minutes: 30
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Install Rust Toolchain"
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain | Select-String '^channel\s*=').ToString() -replace '.*=\s*"([^"]+)".*','$1'
+          rustup toolchain install $toolchain
+          rustup show
+          rustup component add --toolchain $toolchain clippy
+
+      # The runner image does not ship ShellCheck, which shell-lint-check needs. Install a pinned
+      # release with a verified checksum, so that new ShellCheck releases cannot break this job.
+      - name: "Install ShellCheck"
+        shell: pwsh
+        env:
+          SHELLCHECK_VERSION: "v0.11.0"
+          SHELLCHECK_SHA256: "8a4e35ab0b331c85d73567b12f2a444df187f483e5079ceffa6bda1faa2e740e"
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "shellcheck.zip"
+          $installDir = Join-Path $env:RUNNER_TEMP "shellcheck"
+          $releases = "https://github.com/koalaman/shellcheck/releases/download"
+          $asset = "shellcheck-$env:SHELLCHECK_VERSION.zip"
+          Invoke-WebRequest -Uri "$releases/$env:SHELLCHECK_VERSION/$asset" -OutFile $archive `
+            -MaximumRetryCount 3 -RetryIntervalSec 10
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+          if ($hash -ne $env:SHELLCHECK_SHA256) {
+            throw "ShellCheck checksum mismatch: expected $env:SHELLCHECK_SHA256, got $hash."
+          }
+          Expand-Archive -Path $archive -DestinationPath $installDir -Force
+          & (Join-Path $installDir "shellcheck.exe") --version
+          Add-Content -Path $env:GITHUB_PATH -Value $installDir
+
+      - name: "Lint"
+        shell: pwsh
+        run: |
+          .\z.ps1 build -- lint-check MACHINE=${{ matrix.machine-type }} TARGET=${{ matrix.target-arch }}
+
+  # Verus formal verification on Windows. Only standalone deployment is supported
+  # on Windows, so the matrix covers machine-type only.
+  windows-verify:
+    name: "Windows Verify (${{ matrix.machine-type }})"
+    needs: [ precheck ]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        machine-type: [ microvm ]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' && (
+        github.event_name == 'merge_group' || github.event_name == 'schedule' || (
+          needs.precheck.outputs.up_to_date == 'true' && (
+            github.event_name != 'push' ||
+            github.event.head_commit == null ||
+            !startsWith(github.event.head_commit.message, 'Merge ')
+          ) && (
+            github.event_name != 'pull_request' ||
+            !github.event.pull_request.draft
+          )
+        )
+      )
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Install Rust Toolchain"
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain | Select-String '^channel\s*=').ToString() -replace '.*=\s*"([^"]+)".*','$1'
+          rustup toolchain install $toolchain
+          rustup show
+
+      - name: "Verify"
+        uses: ./.github/actions/verify
+        with:
+          machine-type: ${{ matrix.machine-type }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build all components (guest + host) natively on Windows using the local
+  # cross-compilation toolchain (GNU Make + rust-lld) and run unit tests.
+  windows-ci-build:
+    name: "Windows Build (${{ matrix.build-type }}, ${{ matrix.target-arch }}, ${{
+      matrix.machine-type }}, ${{ matrix.memory-size }}mb)"
+    needs: [ changes, windows-format-check, windows-lint-check, windows-verify ]
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    # !failure() ensures the build does not start when checks/lint/verify fail.
+    # Documentation-only pull requests skip the build and, transitively, the
+    # integration tests that consume its artifacts.
+    if: |
+      !cancelled() && !failure() &&
+      needs.changes.outputs.docs-only != 'true' &&
+      needs.windows-format-check.result == 'success' &&
+      needs.windows-lint-check.result == 'success' &&
+      needs.windows-verify.result == 'success'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ${{ fromJSON(github.event_name == 'pull_request' && '["debug","release"]' ||
+          github.event_name == 'workflow_dispatch' && '["debug","release"]' ||
+          '["release"]') }}
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+        memory-size: [ 256 ]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      # Grant cache write access so the sccache GHA backend can persist
+      # compilation artifacts across runs.
+      actions: write
+    env:
+      MACHINE_TYPE: ${{ matrix.machine-type }}
+      TARGET_ARCH: ${{ matrix.target-arch }}
+      # Opt into sccache's GitHub Actions cache backend (see ci-build). The
+      # sccache-action does not set this flag, so without it Windows builds use
+      # a local cache discarded with the ephemeral runner, staying cold.
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Install Rust Toolchain"
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain | Select-String '^channel\s*=').ToString() -replace '.*=\s*"([^"]+)".*','$1'
+          rustup toolchain install $toolchain
+          rustup show
+          rustup component add --toolchain $toolchain clippy rustfmt
+
+      # Install sccache and wire up the GitHub Actions cache backend so Windows
+      # builds reuse cached compilation artifacts across runs. Without caching
+      # the GitHub-hosted Windows runner's ephemeral disk discards the local
+      # sccache cache every run, leaving Windows builds permanently cold. The
+      # action installs sccache, adds it to PATH (picked up by the Makefile's
+      # RUSTC_WRAPPER auto-detection), and exports the GHA cache-service URL and
+      # token; the SCCACHE_GHA_ENABLED flag itself is set at the job level above.
+      - name: "Setup sccache"
+        uses: Mozilla-Actions/sccache-action@v0.0.11
+        with:
+          version: "v0.10.0"
+
+      # Start the sccache server ahead of the build (see ci-build).
+      - name: "Start sccache Server"
+        uses: ./.github/actions/sccache-start
+
+      - name: "Setup Prerequisites"
+        shell: pwsh
+        run: |
+          $osVersion = [System.Environment]::OSVersion.Version
+          if ($osVersion.Build -ge 22000) {
+            Write-Host "Detected Windows build $($osVersion.Build) (Windows 11 or later). Running z.ps1 setup..."
+            .\z.ps1 setup
+          }
+          else {
+            Write-Host "Detected Windows build $($osVersion.Build) (< 22000). Skipping z.ps1 setup on CI runner."
+          }
+
+      - name: "Isolate Cargo Home"
+        shell: pwsh
+        run: |
+          # Isolate Cargo home per job to prevent git-cache corruption on
+          # Windows runners that may share the same filesystem across runs.
+          # Symlink the toolchain bin/ directory so that the Makefile can
+          # still resolve $env:CARGO_HOME/bin/cargo.
+          $isolatedCargo = Join-Path $env:RUNNER_TEMP ".cargo"
+          New-Item -ItemType Directory -Force -Path $isolatedCargo | Out-Null
+          $cargoBin = Join-Path $isolatedCargo "bin"
+          if (Test-Path $cargoBin) { Remove-Item $cargoBin -Force -Recurse }
+          New-Item -ItemType SymbolicLink -Path $cargoBin -Target (Join-Path $env:USERPROFILE ".cargo\bin") | Out-Null
+          echo "CARGO_HOME=$isolatedCargo" >> $env:GITHUB_ENV
+          Write-Host "Isolated CARGO_HOME to $isolatedCargo"
+
+      - name: "Build & Unit Test"
+        shell: pwsh
+        env:
+          LOG_LEVEL: ${{ matrix.build-type == 'release' && 'error' || 'trace' }}
+          RELEASE_FLAG: ${{ matrix.build-type == 'release' && 'RELEASE=yes' || '' }}
+        run: |
+          .\z.ps1 build -- all run-unit-tests all-posix-test-images $env:RELEASE_FLAG MACHINE=$env:MACHINE_TYPE TARGET=$env:TARGET_ARCH LOG_LEVEL=$env:LOG_LEVEL MEMORY_SIZE=${{ matrix.memory-size }}
+
+      - name: "Upload Build Artifacts"
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-build-${{ matrix.target-arch }}-${{ matrix.machine-type }}-${{
+            matrix.build-type }}-${{ matrix.memory-size }}mb
+          retention-days: 1
+          path: bin/
+
+  # Run the full standalone test suite on Windows Hypervisor Platform using nanvix-test.exe,
+  # mirroring the Linux CI integration-test stage.
+  windows-integration-test:
+    name: "Windows Integration Test (${{ matrix.build-type }}, ${{
+      matrix.target-arch }}, ${{ matrix.machine-type }}, shard ${{ matrix.shard }}/4)"
+    needs: [ windows-ci-build ]
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: ${{ !cancelled() && needs.windows-ci-build.result == 'success' }}
+    # Debug guests run ~15x slower than release under WHP. Partitioning the
+    # integration + POSIX suites into disjoint shards keeps each runner well
+    # under the timeout even for debug. Allow headroom over the 30 min default.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ${{ fromJSON(github.event_name == 'pull_request' && '["debug","release"]' ||
+          github.event_name == 'workflow_dispatch' && '["debug","release"]' ||
+          '["release"]') }}
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+        memory-size: [ 256 ]
+        # Integration tests are partitioned into disjoint shards via the harness
+        # `-shard INDEX/TOTAL` option (round-robin), so new tests distribute
+        # automatically. To change the shard count, update this list AND the
+        # `/4` divisors used in the test steps below so they stay in sync.
+        shard: [ 1, 2, 3, 4 ]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Download Build Artifacts"
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-build-${{ matrix.target-arch }}-${{ matrix.machine-type }}-${{ matrix.build-type }}-${{ matrix.memory-size }}mb
+          path: bin
+
+      - name: "Exclude bin/ from Windows Defender"
+        shell: pwsh
+        run: |
+          # Prevent Defender from quarantining unsigned executables extracted
+          # from the build artifact. If the Defender service is not running
+          # (error 0x800106ba on some runner images), the exclusion is
+          # unnecessary — skip gracefully.
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "bin"
+          try {
+            Add-MpPreference -ExclusionPath $binDir
+            Write-Host "Added Defender exclusion for $binDir"
+          } catch {
+            $errorMessage = $_.Exception.Message
+            Write-Host "::warning::Could not add Defender exclusion: $errorMessage"
+            Write-Host "Full Defender exclusion error: $_"
+          }
+
+      - name: "Verify Build Artifacts"
+        shell: pwsh
+        run: |
+          Get-ChildItem bin -Filter *.exe | Format-Table Name, Length
+          Get-ChildItem bin -Filter *.elf | Format-Table Name, Length
+          Get-ChildItem bin -Filter *.img | Format-Table Name, Length
+
+      - name: "Check Windows Hypervisor Platform"
+        id: whp-check
+        shell: pwsh
+        run: |
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
+          if ($feature.State -ne 'Enabled') {
+            Write-Host "::warning::Windows Hypervisor Platform is not enabled — skipping integration tests."
+            echo "whp_available=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          Write-Host "HypervisorPlatform feature is enabled."
+
+          # Probe whether WHP can actually boot a guest by running hello-rust-nostd
+          # with a short timeout. GitHub-hosted runners may report the feature as
+          # enabled without functional nested virtualization.
+          Write-Host "Probing WHP with hello-rust-nostd (30s timeout)..."
+          $proc = Start-Process -FilePath ".\bin\nanvixd.exe" `
+            -ArgumentList "-- .\bin\hello-rust-nostd.elf" `
+            -PassThru -NoNewWindow -RedirectStandardOutput "whp-probe-stdout.txt" `
+            -RedirectStandardError "whp-probe-stderr.txt"
+
+          $exited = $proc | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+          if (-not $proc.HasExited) {
+            $proc | Stop-Process -Force
+            Write-Host "::warning::WHP probe timed out — hypervisor is not functional on this runner. Skipping integration tests."
+            echo "whp_available=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "::warning::WHP probe failed with exit code $($proc.ExitCode) — skipping integration tests."
+            Get-Content "whp-probe-stderr.txt" -ErrorAction SilentlyContinue | Write-Host
+            echo "whp_available=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          Write-Host "WHP probe succeeded — hypervisor is functional."
+          echo "whp_available=true" >> $env:GITHUB_OUTPUT
+
+      # In-kernel tests are deployment- and shard-agnostic, so run them only on
+      # the first shard to avoid redundant work across the parallel shard runners.
+      - name: "In-Kernel Tests (${{ matrix.machine-type }})"
+        if: steps.whp-check.outputs.whp_available == 'true' && matrix.build-type ==
+          'debug' && matrix.shard == 1
+        shell: pwsh
+        env:
+          RUST_LOG: debug
+        run: |
+          .\z.ps1 build -- run-kernel-tests "MACHINE=${{ matrix.machine-type }}" TARGET=${{ matrix.target-arch }} LOG_LEVEL=trace
+          Write-Host "In-kernel tests passed."
+
+      - name: "Run Integration Tests (shard ${{ matrix.shard }}/4)"
+        if: steps.whp-check.outputs.whp_available == 'true'
+        shell: pwsh
+        env:
+          RUST_LOG: trace
+          # Forwarded to the harness so it can gate build-mode-restricted tests (e.g. heavy tests
+          # marked release-only via `build_modes`, which are too slow under a debug/trace build).
+          BUILD_MODE: ${{ matrix.build-type }}
+        run: |
+          # The config path must be the last argument, so -shard precedes it.
+          & .\bin\nanvix-test.exe -shard "${{ matrix.shard }}/4" .\test\test-standalone-windows.toml
+
+      # Ported POSIX C test suites. Boots the prebuilt <suite>.initrd images
+      # (built by the Windows build job via all-posix-test-images and downloaded
+      # with the artifact) directly under WHP through the nanvix-test harness,
+      # asserting the expected exit code of each guest. No rebuild is needed here.
+      - name: "POSIX C Suites (${{ matrix.machine-type }}, shard ${{ matrix.shard }}/4)"
+        if: steps.whp-check.outputs.whp_available == 'true'
+        shell: pwsh
+        env:
+          RUST_LOG: info
+          # Forwarded to the harness so it can gate build-mode-restricted tests.
+          BUILD_MODE: ${{ matrix.build-type }}
+        run: |
+          # The config path must be the last argument, so -shard precedes it.
+          & .\bin\nanvix-test.exe -shard "${{ matrix.shard }}/4" .\test\test-posix-windows.toml
+
+      - name: "Upload logs in case of failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-windows-integration-logs-${{ github.event.pull_request.number ||
+            github.run_number }}-${{ matrix.target-arch }}-${{ matrix.machine-type }}-${{
+            matrix.build-type }}-shard${{ matrix.shard }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+
+  # ==========================================================================================
+  # Stage 3: Benchmark (Self-Hosted Runners)
+  # ==========================================================================================
+
+  # Build from source and run micro-benchmarks on baremetal self-hosted runners.
+  # A finalize job aggregates results after the benchmark completes.
+  benchmark:
+    name: "Benchmark (${{ matrix.machine-type }})"
+    needs: [ benchmark-gate-linux ]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # An explicit top-level axis is required so the matrix expands into a
+        # concrete job. With `include:` alone GitHub Actions occasionally
+        # collapses the matrix to zero combinations and reports the job as
+        # skipped even when its `if:` guard would have passed.
+        machine-type: [ microvm ]
+        include:
+          - machine-type: microvm
+            standard-benchmarks: "boot-time cold-start cold-start-uvm snapshot-restore
+              syscall-bench warm-start-gateway warm-start-vmm"
+            standard-iterations: "100"
+            payload-size: ""
+            vfs-benchmarks: "vfs-bench"
+            vfs-iterations: "100"
+            standalone-socket-benchmarks: "warm-start-socket"
+            standalone-socket-iterations: "100"
+    runs-on: [ self-hosted, Linux, benchmark ]
+    permissions:
+      contents: read
+
+    # Eligibility (repo, event, precheck, draft, fork PR, documentation-only
+    # changes, runner availability) is consolidated in the benchmark-gate-linux
+    # job. Skip gracefully when the gate reports the benchmark pipeline should
+    # not run (e.g. no Linux self-hosted runners are online).
+    #
+    # NOTE: !cancelled() is required so the matrix expands when an ancestor
+    # in the needs graph is skipped (e.g. precheck on schedule events).
+    # Without it, GitHub Actions applies the implicit success() guard and
+    # collapses the matrix pre-expansion, marking this job as skipped even
+    # when the gate reports should-run=true.
+    if: ${{ !cancelled() && needs.benchmark-gate-linux.outputs.should-run == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Isolate Cargo Home"
+        shell: bash
+        run: |
+          # Isolate Cargo home per job to prevent concurrent git-cache races on
+          # self-hosted runners that share the same filesystem.  Symlink the
+          # toolchain bin/ directory so that the Makefile can still resolve
+          # $CARGO_HOME/bin/cargo.
+          mkdir -p "$RUNNER_TEMP/.cargo"
+          ln -sfn "$HOME/.cargo/bin" "$RUNNER_TEMP/.cargo/bin"
+          echo "CARGO_HOME=$RUNNER_TEMP/.cargo" >> "$GITHUB_ENV"
+
+      - name: "Pre-Cleanup Dangling Resources"
+        uses: ./.github/actions/cleanup
+        with:
+          phase: pre
+
+      - name: "Link Toolchain Directory"
+        uses: ./.github/actions/link-toolchain
+
+      - name: "Build (Standard)"
+        uses: ./.github/actions/benchmark-build
+        with:
+          machine-type: "${{ matrix.machine-type }}"
+
+      - name: "Run Micro-Benchmarks (Standard)"
+        uses: ./.github/actions/benchmark-run
+        with:
+          benchmarks: "${{ matrix.standard-benchmarks }}"
+          machine-type: "${{ matrix.machine-type }}"
+          iterations: "${{ matrix.standard-iterations }}"
+          payload-size: "${{ matrix.payload-size }}"
+
+      - name: "Run VFS Benchmarks"
+        if: matrix.vfs-benchmarks != ''
+        uses: ./.github/actions/benchmark-run
+        with:
+          benchmarks: "${{ matrix.vfs-benchmarks }}"
+          machine-type: "${{ matrix.machine-type }}"
+          iterations: "${{ matrix.vfs-iterations }}"
+
+      - name: "Run Standalone Socket Benchmarks"
+        if: matrix.standalone-socket-benchmarks != ''
+        uses: ./.github/actions/benchmark-run
+        with:
+          benchmarks: "${{ matrix.standalone-socket-benchmarks }}"
+          machine-type: "${{ matrix.machine-type }}"
+          iterations: "${{ matrix.standalone-socket-iterations }}"
+
+      - name: "Upload Benchmark Results"
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ matrix.machine-type }}
+          overwrite: true
+          retention-days: 1
+          path: nanvix_bench_*.csv
+
+      - name: "Dump SCCACHE Statistics"
+        if: always()
+        uses: ./.github/actions/sccache-stats
+
+      - name: "Post-Cleanup Dangling Resources"
+        if: always()
+        uses: ./.github/actions/cleanup
+        with:
+          phase: post
+
+      - name: "Upload logs in case of benchmark failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-benchmark-logs-${{ github.event.pull_request.number ||
+            github.run_number }}-${{ matrix.machine-type }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+            bench_*.txt
+
+  # Build from source and run micro-benchmarks on self-hosted Windows baremetal
+  # runners. Only standalone-mode benchmarks are supported (boot-time, cold-start,
+  # snapshot-restore, syscall-bench, vfs-bench, warm-start-gateway, warm-start-vmm,
+  # warm-start-socket). The self-hosted runner is a dedicated machine with a known-functional WHP
+  # hypervisor, so the WHP probe and Defender exclusion steps are omitted.
+  windows-benchmark:
+    name: "Windows Benchmark (${{ matrix.machine-type }})"
+    needs: [ benchmark-gate-windows ]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # An explicit top-level axis is required so the matrix expands into a
+        # concrete job. With `include:` alone GitHub Actions occasionally
+        # collapses the matrix to zero combinations and reports the job as
+        # skipped even when its `if:` guard would have passed.
+        machine-type: [ microvm ]
+        include:
+          - machine-type: microvm
+            standard-benchmarks: "boot-time cold-start cold-start-uvm snapshot-restore
+              syscall-bench vfs-bench warm-start-gateway warm-start-vmm warm-start-socket"
+            standard-iterations: "100"
+            payload-size: ""
+            profiler: "PROFILER=yes"
+    runs-on: [ self-hosted, Windows, benchmark ]
+    permissions:
+      contents: read
+
+    # Eligibility (repo, event, precheck, draft, fork PR, documentation-only
+    # changes, runner availability) is consolidated in the benchmark-gate-windows
+    # job. Skip gracefully when the gate reports the benchmark pipeline should
+    # not run (e.g. no Windows self-hosted runners are online).
+    #
+    # NOTE: !cancelled() is required so the matrix expands when an ancestor
+    # in the needs graph is skipped (e.g. precheck on schedule events).
+    # Without it, GitHub Actions applies the implicit success() guard and
+    # collapses the matrix pre-expansion, marking this job as skipped even
+    # when the gate reports should-run=true.
+    if: ${{ !cancelled() && needs.benchmark-gate-windows.outputs.should-run == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Restore Directory Symlinks as Junctions"
+        shell: pwsh
+        run: |
+          # Git checks out symlinks as plain text files on Windows when the
+          # service account lacks SeCreateSymbolicLinkPrivilege. Directory
+          # symlinks end up as small text stubs containing the target path.
+          # Convert them to NTFS junctions, which need no special privileges.
+          git ls-files -s | ForEach-Object {
+            if ($_ -match '^120000\s+\S+\s+\S+\t(.+)$') {
+              $relPath = $Matches[1]
+              $fullPath = Join-Path $PWD $relPath
+              if ((Test-Path $fullPath) -and -not (Test-Path $fullPath -PathType Container)) {
+                $target = (Get-Content $fullPath -Raw).Trim()
+                $parentDir = Split-Path $fullPath
+                $resolved = [System.IO.Path]::GetFullPath((Join-Path $parentDir $target))
+                if (Test-Path $resolved -PathType Container) {
+                  Remove-Item $fullPath -Force
+                  cmd /c mklink /J "$fullPath" "$resolved" | Out-Null
+                  Write-Host "Junction: $relPath -> $target"
+                }
+              }
+            }
+          }
+
+      - name: "Refresh PATH from Registry"
+        shell: pwsh
+        run: |
+          # Self-hosted runner services may have a stale PATH from when the
+          # service was started. Re-read the current Machine and User PATH
+          # from the registry so that tools installed after the service
+          # started (e.g., rustup) are found.
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $userPath    = [Environment]::GetEnvironmentVariable("Path", "User")
+          $env:PATH    = "$machinePath;$userPath"
+          echo "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: "Set Rust Environment"
+        shell: pwsh
+        run: |
+          # The runner service runs as NetworkService, but Rust was installed
+          # under the Administrator account. Set CARGO_HOME so the Makefile
+          # can resolve $CARGO_HOME/bin/cargo. RUSTUP_HOME is intentionally
+          # left unset to avoid cross-account directory ownership issues;
+          # rustup is found via PATH instead. This is a dedicated baremetal
+          # runner with a pre-installed toolchain.
+          echo "CARGO_HOME=C:\Users\Administrator\.cargo" >> $env:GITHUB_ENV
+
+      - name: "Isolate Cargo Home"
+        shell: pwsh
+        run: |
+          # Isolate Cargo home per job to prevent git-cache corruption on
+          # Windows runners that may share the same filesystem across runs.
+          # Use an NTFS junction for the toolchain bin/ directory so that
+          # the Makefile can still resolve $env:CARGO_HOME/bin/cargo
+          # without requiring symlink privileges.
+          $cargoTarget = Join-Path $env:CARGO_HOME "bin"
+          $isolatedCargo = Join-Path $env:RUNNER_TEMP ".cargo"
+          New-Item -ItemType Directory -Force -Path $isolatedCargo | Out-Null
+          $cargoBin = Join-Path $isolatedCargo "bin"
+          if (Test-Path $cargoBin) { Remove-Item $cargoBin -Force -Recurse }
+          cmd /c "mklink /J `"$cargoBin`" `"$cargoTarget`"" | Out-Null
+          echo "CARGO_HOME=$isolatedCargo" >> $env:GITHUB_ENV
+          Write-Host "Isolated CARGO_HOME to $isolatedCargo"
+
+      - name: "Verify Rust Toolchain"
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain | Select-String '^channel\s*=').ToString() -replace '.*=\s*"([^"]+)".*','$1'
+          Write-Host "Expected toolchain: $toolchain"
+          rustup show
+          cargo --version
+
+      - name: "Setup Prerequisites"
+        shell: pwsh
+        run: |
+          $osVersion = [System.Environment]::OSVersion.Version
+          if ($osVersion.Build -ge 22000) {
+            Write-Host "Detected Windows build $($osVersion.Build) (Windows 11 or later). Running z.ps1 setup..."
+            .\z.ps1 setup
+          }
+          else {
+            Write-Host "Detected Windows build $($osVersion.Build) (< 22000). Skipping z.ps1 setup on CI runner."
+          }
+
+      - name: "Build"
+        shell: pwsh
+        env:
+          MACHINE_TYPE: ${{ matrix.machine-type }}
+          PROFILER_FLAG: ${{ matrix.profiler }}
+        run: |
+          .\z.ps1 build -- all MACHINE=$env:MACHINE_TYPE RELEASE=yes LOG_LEVEL=panic $env:PROFILER_FLAG
+
+      - name: "Run Micro-Benchmarks"
+        shell: pwsh
+        env:
+          BENCHMARKS: ${{ matrix.standard-benchmarks }}
+          MACHINE_TYPE: ${{ matrix.machine-type }}
+          ITERATIONS: ${{ matrix.standard-iterations }}
+          PAYLOAD_SIZE: ${{ matrix.payload-size }}
+        run: |
+          foreach ($bench in $env:BENCHMARKS -split ' ') {
+            Write-Host "[INFO] Running benchmark '${bench}'..."
+            $benchmarkArgs = @(
+              "run",
+              "--benchmark", $bench,
+              "--machine-type", $env:MACHINE_TYPE,
+              "--iterations", $env:ITERATIONS
+            )
+            if (($bench -in @("warm-start-gateway", "warm-start-vmm", "warm-start-socket")) -and
+                -not [string]::IsNullOrWhiteSpace($env:PAYLOAD_SIZE)) {
+              $benchmarkArgs += @("--payload-size", $env:PAYLOAD_SIZE)
+            }
+            $benchmarkArgs += @(
+              "--output-dir", ".",
+              "--commit", "${{ github.sha }}"
+            )
+            python scripts/benchmark.py @benchmarkArgs
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Benchmark '${bench}' failed with exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
+          }
+
+      - name: "Upload Benchmark Results"
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-windows-baremetal-results-${{ matrix.machine-type }}
+          overwrite: true
+          retention-days: 1
+          path: nanvix_bench_*.csv
+
+      - name: "Upload logs in case of benchmark failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-benchmark-windows-baremetal-logs-${{
+            github.event.pull_request.number || github.run_number }}-${{
+            matrix.machine-type }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+            bench_*.txt
+
+  # Aggregate benchmark results, gate on regressions, and persist the updated
+  # baselines on dev. Results are stored in www/bench/data/linux-baremetal/ so
+  # that the static site can serve them.
+  benchmark-finalize:
+    name: "Benchmark Finalize"
+    needs: [ benchmark-gate-linux, benchmark ]
+    # Run only when the Linux benchmark gate enabled the pipeline AND every
+    # benchmark matrix leg succeeded. If the gate skipped the pipeline (e.g.
+    # no runners online), finalize is skipped as well.
+    if: ${{ !cancelled() &&
+      needs.benchmark-gate-linux.outputs.should-run == 'true' &&
+      needs.benchmark.result == 'success' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    outputs:
+      bench_url: ${{ steps.url.outputs.bench_url }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Use the deploy SSH key so that benchmark-persist can push results
+          # to the dev branch (the deploy key is a bypass actor for branch
+          # protection rules, matching the approach in create-release).
+          ssh-key: ${{ secrets.DEPLOY_PRIVATE_SSH_KEY }}
+
+      - name: "Download Benchmark Results"
+        uses: actions/download-artifact@v8
+        with:
+          pattern: benchmark-results-*
+          path: linux-baremetal
+          merge-multiple: true
+
+      - name: "Generate Benchmark URL"
+        id: url
+        shell: bash
+        run: |
+          benchmarks="boot-time,cold-start,cold-start-uvm,snapshot-restore,syscall-bench,vfs-bench,warm-start-gateway,warm-start-vmm,warm-start-socket"
+          url=$(python3 ./scripts/benchmark.py \
+            ci-url \
+            --target-dir "linux-baremetal" \
+            --benchmarks "${benchmarks}" \
+            --machine-types "microvm" \
+            --archs "X64" \
+            --commit "${{ github.sha }}" \
+            --base-url "https://nanvix.github.io/nanvix/")
+          echo "bench_url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: "Gate on Performance Regressions"
+        if: github.ref_name != 'dev'
+        shell: bash
+        # syscall-bench and vfs-bench use a different CSV schema. Size-sweep benchmarks are
+        # also excluded.
+        # The in-tree baseline matches dev: the gate only runs the pipeline for
+        # branches that are up to date with it.
+        run: |
+          benchmarks="boot-time,cold-start,cold-start-uvm,snapshot-restore"
+          python3 ./scripts/benchmark.py \
+            ci-gate \
+            --dev-dir "www/bench/data/linux-baremetal" \
+            --target-dir "linux-baremetal" \
+            --benchmarks "${benchmarks}" \
+            --machine-types "microvm" \
+            --archs "X64" \
+            --regression-threshold 40 \
+            --baseline-window 20
+
+      - name: "Persist results on dev"
+        if: github.ref_name == 'dev'
+        uses: ./.github/actions/benchmark-persist
+        with:
+          benchmarks: "boot-time,cold-start,cold-start-uvm,snapshot-restore,syscall-bench,\
+            vfs-bench,warm-start-gateway,warm-start-vmm,warm-start-socket"
+          machine-types: "microvm"
+          archs: "X64"
+          source-dir: "linux-baremetal"
+          target-dir: "www/bench/data/linux-baremetal"
+
+      - name: "Upload logs in case of finalize failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-benchmark-finalize-logs-${{ github.event.pull_request.number ||
+            github.run_number }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+
+  # Aggregate Windows baremetal benchmark results, gate on regressions,
+  # and persist the updated baselines on dev.
+  # Results are stored in www/bench/data/windows-baremetal/ to keep them
+  # isolated from the Linux baselines.
+  windows-benchmark-finalize:
+    name: "Windows Benchmark Finalize"
+    needs: [ benchmark-gate-windows, windows-benchmark, benchmark-finalize ]
+    # Run only when the Windows benchmark gate enabled the pipeline AND every
+    # windows-benchmark matrix leg succeeded. If the gate skipped the pipeline
+    # (e.g. no runners online), finalize is skipped as well.
+    # Depends on benchmark-finalize to serialize pushes to dev and avoid
+    # rebase conflicts on append-only CSV files within the same pipeline run.
+    # Uses always() so this job is not skipped when benchmark-finalize is
+    # skipped or fails (e.g., a Linux benchmark leg fails).
+    if: ${{ always() && !cancelled() &&
+      needs.benchmark-gate-windows.outputs.should-run == 'true' &&
+      needs.windows-benchmark.result == 'success' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    outputs:
+      bench_url: ${{ steps.url.outputs.bench_url }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        if: github.ref_name != 'dev'
+
+      - uses: actions/checkout@v7
+        if: github.ref_name == 'dev'
+        with:
+          # Use the deploy SSH key so that benchmark-persist can push results
+          # to the dev branch.
+          ssh-key: ${{ secrets.DEPLOY_PRIVATE_SSH_KEY }}
+
+      - name: "Download Benchmark Results"
+        uses: actions/download-artifact@v8
+        with:
+          pattern: benchmark-windows-baremetal-results-*
+          path: windows-baremetal
+          merge-multiple: true
+
+      - name: "Generate Benchmark URL"
+        id: url
+        shell: bash
+        run: |
+          benchmarks="boot-time,cold-start,cold-start-uvm,snapshot-restore,syscall-bench,vfs-bench,warm-start-gateway,warm-start-vmm,warm-start-socket"
+          url=$(python3 ./scripts/benchmark.py \
+            ci-url \
+            --target-dir "windows-baremetal" \
+            --benchmarks "${benchmarks}" \
+            --machine-types "microvm" \
+            --archs "X64" \
+            --commit "${{ github.sha }}" \
+            --base-url "https://nanvix.github.io/nanvix/")
+          echo "bench_url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: "Gate on Performance Regressions"
+        if: github.ref_name != 'dev'
+        shell: bash
+        # syscall-bench and vfs-bench are excluded: they use a different CSV schema (not
+        # percentile-based).
+        # Size-sweep benchmarks are also excluded (multi-row).
+        # The in-tree baseline matches dev: the gate only runs the pipeline for
+        # branches that are up to date with it.
+        run: |
+          benchmarks="boot-time,cold-start,cold-start-uvm"
+          python3 ./scripts/benchmark.py \
+            ci-gate \
+            --dev-dir "www/bench/data/windows-baremetal" \
+            --target-dir "windows-baremetal" \
+            --benchmarks "${benchmarks}" \
+            --machine-types "microvm" \
+            --archs "X64" \
+            --regression-threshold 40 \
+            --baseline-window 20
+
+      - name: "Persist results on dev"
+        if: github.ref_name == 'dev'
+        uses: ./.github/actions/benchmark-persist
+        with:
+          benchmarks: "boot-time,cold-start,cold-start-uvm,snapshot-restore,syscall-bench,\
+            vfs-bench,warm-start-gateway,warm-start-vmm,warm-start-socket"
+          machine-types: "microvm"
+          archs: "X64"
+          source-dir: "windows-baremetal"
+          target-dir: "www/bench/data/windows-baremetal"
+
+      - name: "Upload logs in case of finalize failures"
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanvix-benchmark-windows-baremetal-finalize-logs-${{
+            github.event.pull_request.number || github.run_number }}
+          overwrite: "true"
+          path: |
+            logs/
+            **/*.log
+            **/*.out
+            **/*.err
+
+  # Post a single PR comment with links to both platform benchmark views.
+  # Fork PRs never reach this job: the benchmark gates skip the whole pipeline
+  # for them, so the token here always has write access.
+  benchmark-report:
+    name: "Benchmark Report"
+    needs: [ benchmark-finalize, windows-benchmark-finalize ]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' &&
+      (needs.benchmark-finalize.result == 'success' ||
+      needs.windows-benchmark-finalize.result == 'success') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: "Find existing benchmark comment"
+        uses: peter-evans/find-comment@v4
+        id: fc
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: "🔬 Benchmark Results"
+
+      - name: "Post benchmark comment"
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            ## 🔬 Benchmark Results
+            - ${{ needs.benchmark-finalize.outputs.bench_url && format('[Linux]({0})', needs.benchmark-finalize.outputs.bench_url) || 'Linux (skipped)' }}
+            - ${{ needs.windows-benchmark-finalize.outputs.bench_url && format('[Windows]({0})', needs.windows-benchmark-finalize.outputs.bench_url) || 'Windows (skipped)' }}
+
+  # ==========================================================================================
+  # Required Status Check
+  # ==========================================================================================
+
+  # The dev ruleset requires this single check, on pull requests and in the
+  # merge queue, rather than the checks of individual jobs. Add every new
+  # validation job to its needs. It must run even when the jobs that it needs
+  # fail or are skipped: a skipped job reports success to a required check.
+  required-status-check:
+    name: "Required status check"
+    needs:
+      - precheck
+      - check-runners
+      - changes
+      - benchmark-gate-linux
+      - benchmark-gate-windows
+      - checks
+      - lint
+      - verify
+      - ci-build
+      - ci-test
+      - ci-test-extras
+      - windows-format-check
+      - windows-lint-check
+      - windows-verify
+      - windows-ci-build
+      - windows-integration-test
+      - benchmark
+      - windows-benchmark
+      - benchmark-finalize
+      - windows-benchmark-finalize
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions: {}
+
+    steps:
+      - name: "Verify Required Jobs"
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+
+          results="$(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<< "${NEEDS}")"
+          if [[ -z "${results}" ]]; then
+            echo "::error::No job results to verify."
+            exit 1
+          fi
+
+          # Jobs may be skipped by design (documentation-only changes, drafts,
+          # branches behind dev, offline benchmark runners), but none may fail
+          # or be cancelled.
+          status=0
+          while read -r job result; do
+            echo "${job}: ${result}"
+            if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then
+              echo "::error::Job '${job}' did not succeed (${result})."
+              status=1
+            fi
+          done <<< "${results}"
+
+          # The merge queue is the last gate before dev, so source checks,
+          # builds, and tests must have actually run there.
+          if [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            for job in checks lint verify ci-build ci-test ci-test-extras \
+              windows-format-check windows-lint-check windows-verify \
+              windows-ci-build windows-integration-test; do
+              result="$(jq -r --arg job "${job}" '.[$job].result' <<< "${NEEDS}")"
+              if [[ "${result}" != "success" ]]; then
+                echo "::error::Job '${job}' must succeed in the merge queue (${result})."
+                status=1
+              fi
+            done
+          fi
+
+          exit "${status}"
+
+  # ==========================================================================================
+  # Stage 4: Post Actions (Conditional)
+  # ==========================================================================================
+
+  # Create release archives for all applicable configurations.
+  release-archive:
+    name: "Release Archive (${{ matrix.target-arch }}, ${{ matrix.machine-type }},
+      ${{ matrix.memory-size }}mb)"
+    needs:
+      - ci-test
+      - ci-test-extras
+      - benchmark-gate-linux
+      - benchmark-gate-windows
+      - benchmark-finalize
+      - windows-benchmark-finalize
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    # Benchmark finalize may be skipped when self-hosted runners are offline;
+    # release proceeds if the corresponding gate reported the benchmark
+    # pipeline should not run.
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' &&
+      github.ref == 'refs/heads/dev' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      needs.ci-test.result == 'success' &&
+      needs.ci-test-extras.result == 'success' &&
+      (needs.benchmark-finalize.result == 'success' ||
+        needs.benchmark-gate-linux.outputs.should-run != 'true') &&
+      (needs.windows-benchmark-finalize.result == 'success' ||
+        needs.benchmark-gate-windows.outputs.should-run != 'true')
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+        memory-size: [ 256 ]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Download CI Build Artifacts"
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-build-release-${{ matrix.target-arch }}-${{ matrix.machine-type
+            }}-${{ matrix.memory-size }}mb
+          path: .
+
+      - name: "Package Release Archive"
+        id: release-archive
+        uses: ./.github/actions/release-package
+        with:
+          target-arch: "${{ matrix.target-arch }}"
+          machine-type: "${{ matrix.machine-type }}"
+          memory-size: "${{ matrix.memory-size }}"
+
+      - name: "Upload Release Artifact"
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target-arch }}-${{ matrix.machine-type }}-${{
+            matrix.memory-size }}mb
+          path: ${{ steps.release-archive.outputs.archive-path }}
+          overwrite: true
+
+  # Package Windows standalone binaries into a release archive (.zip).
+  windows-release-archive:
+    name: "Windows Release Archive (${{ matrix.target-arch }}, ${{
+      matrix.machine-type }}, ${{ matrix.memory-size }}mb)"
+    needs:
+      - windows-integration-test
+      - ci-test
+      - ci-test-extras
+      - benchmark-gate-linux
+      - benchmark-gate-windows
+      - benchmark-finalize
+      - windows-benchmark-finalize
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    # Benchmark finalize may be skipped when self-hosted runners are offline;
+    # release proceeds if the corresponding gate reported the benchmark
+    # pipeline should not run.
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' &&
+      github.ref == 'refs/heads/dev' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      needs.ci-test.result == 'success' &&
+      needs.ci-test-extras.result == 'success' &&
+      (needs.benchmark-finalize.result == 'success' ||
+        needs.benchmark-gate-linux.outputs.should-run != 'true') &&
+      (needs.windows-benchmark-finalize.result == 'success' ||
+        needs.benchmark-gate-windows.outputs.should-run != 'true') &&
+      needs.windows-integration-test.result == 'success'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target-arch: [ x86, x86_64 ]
+        machine-type: [ microvm ]
+        memory-size: [ 256 ]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Download Windows Build Artifacts"
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-build-${{ matrix.target-arch }}-${{matrix.machine-type }}-release-${{ matrix.memory-size }}mb
+          path: windows-bin
+
+      - name: "Package Windows Release Archive"
+        id: package
+        shell: bash
+        run: |
+          commit_id="${GITHUB_SHA}"
+          archive_name="nanvix-windows-${{ matrix.target-arch }}-${{ matrix.machine-type }}-standalone-release-${{ matrix.memory-size }}mb-${commit_id}.zip"
+
+          # Create the zip archive from the downloaded Windows binaries.
+          cd windows-bin
+          zip -r "../${archive_name}" .
+          cd ..
+
+          echo "Packaged Windows release archive: ${archive_name}"
+          ls -lh "${archive_name}"
+          echo "archive-path=${archive_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: "Upload Release Artifact"
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows-${{ matrix.target-arch }}-${{ matrix.machine-type
+            }}-standalone-${{ matrix.memory-size }}mb
+          path: ${{ steps.package.outputs.archive-path }}
+          overwrite: true
+
+  # Publish a versioned release to GitHub.
+  publish-release:
+    name: "Publish Release"
+    needs: [ release-archive, windows-release-archive ]
+    # NOTE: !cancelled() — see comment on 'checks' job (actions/runner#2205).
+    if: |
+      !cancelled() &&
+      github.repository == 'nanvix/nanvix' &&
+      github.ref == 'refs/heads/dev' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      needs.release-archive.result == 'success' &&
+      needs.windows-release-archive.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Publish Release"
+        uses: ./.github/actions/publish-release
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Open a GitHub issue when any job in the release pipeline fails on dev.
+  notify-release-failure:
+    name: "Notify Release Failure"
+    needs:
+      [
+        checks,
+        lint,
+        verify,
+        ci-build,
+        ci-test,
+        ci-test-extras,
+        benchmark-gate-linux,
+        benchmark-gate-windows,
+        benchmark,
+        benchmark-finalize,
+        windows-benchmark,
+        windows-benchmark-finalize,
+        check-runners,
+        changes,
+        release-archive,
+        windows-release-archive,
+        publish-release,
+        windows-format-check,
+        windows-lint-check,
+        windows-verify,
+        windows-ci-build,
+        windows-integration-test,
+      ]
+    if: |
+      always() &&
+      github.repository == 'nanvix/nanvix' &&
+      github.ref == 'refs/heads/dev' &&
+      (
+        contains(needs.*.result, 'failure') ||
+        (
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+          (
+            needs.release-archive.result == 'skipped' ||
+            needs.windows-release-archive.result == 'skipped' ||
+            needs.publish-release.result == 'skipped'
+          )
+        )
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: "Collect Failed or Skipped Jobs"
+        id: failed
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed_jobs=$(echo "${NEEDS_JSON}" | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")')
+          skipped_jobs=$(echo "${NEEDS_JSON}" | jq -r '[to_entries[] | select(.key == "release-archive" or .key == "windows-release-archive" or .key == "publish-release") | select(.value.result == "skipped") | .key] | join(", ")')
+          echo "failed=${failed_jobs}" >> "${GITHUB_OUTPUT}"
+          echo "skipped=${skipped_jobs}" >> "${GITHUB_OUTPUT}"
+
+      - name: "Resolve Admin Team Members"
+        id: team
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Attempt to fetch nanvix/admins team members for issue assignment.
+          # Falls back to "ppenna" if the API call fails or returns an empty list.
+          # NOTE: the admins team is small (well under the 30-member default page
+          # size), so pagination is not needed here.
+          if ! ASSIGNEES=$(gh api orgs/nanvix/teams/admins/members --jq '[.[].login] | join(",")' 2>/dev/null); then
+            ASSIGNEES=""
+          fi
+          if [[ -z "${ASSIGNEES}" || ! "${ASSIGNEES}" =~ ^[a-zA-Z0-9_,.-]+$ ]]; then
+            echo "::warning::Could not fetch nanvix/admins team members; falling back to ppenna."
+            ASSIGNEES="ppenna"
+          fi
+          echo "assignees=${ASSIGNEES}" >> "${GITHUB_OUTPUT}"
+
+      - name: "Create Issue"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > /tmp/ci-issue-body.md <<ISSUE_BODY
+          ## CI/CD Release Pipeline Failure
+
+          The CI/CD pipeline failed on \`dev\` (event: \`${{ github.event_name }}\`).
+
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          **Commit:** [\`${GITHUB_SHA::8}\`](${{ github.server_url }}/${{ github.repository }}/commit/${GITHUB_SHA})
+          **Triggered by:** @${{ github.actor }}
+          **Failed jobs:** ${{ steps.failed.outputs.failed }}
+          **Skipped jobs:** ${{ steps.failed.outputs.skipped }}
+
+          /cc @nanvix/admin
+          Please investigate the failed and skipped jobs linked above and resolve the issue.
+          ISSUE_BODY
+          sed -i 's/^          //' /tmp/ci-issue-body.md
+          gh issue create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "CI/CD pipeline failure on dev (Run #${{ github.run_number }})" \
+            --label "devops:ci" \
+            --assignee "${{ steps.team.outputs.assignees }}" \
+            --body-file /tmp/ci-issue-body.md
+
+  # Bump the patch version on every merge to dev.
+  # This job runs independently of the CI pipeline because the pipeline skips
+  # merge commits while this job specifically targets them.
+  # Artifact publishing is handled separately by the schedule-triggered jobs.
+  create-release:
+    name: "Create Release"
+    # Only run on push-to-dev merge commits.
+    # Guard against infinite loops by excluding github-actions[bot] commits.
+    if: >-
+      github.event_name == 'push' && github.actor != 'github-actions[bot]' &&
+      github.event.head_commit.author.username != 'github-actions[bot]' &&
+      github.event.head_commit.committer.username != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v7
+        with:
+          ssh-key: ${{ secrets.DEPLOY_PRIVATE_SSH_KEY }}
+          fetch-depth: 0
+
+      - name: "Create Release"
+        uses: ./.github/actions/create-release
+        with:
+          bump-type: "patch"

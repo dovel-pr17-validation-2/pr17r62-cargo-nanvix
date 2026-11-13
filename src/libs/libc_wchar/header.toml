@@ -1,0 +1,213 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for wchar.h.
+
+file = "wchar.h"
+brief = "Wide character strings."
+description = '''
+Declares functions for wide character string manipulation and memory
+operations. Implemented by the libc_wchar Rust crate.'''
+includes = ["stdarg.h", "stddef.h", "stdio.h", "locale.h", "time.h"]
+guard = "_NANVIX_WCHAR_H"
+scan_crates = ["libc_wchar", "libc_stdio"]
+content_order = [
+    "rust_types",
+    "rust_constants",
+    "section:0",
+    "section:1",
+    "section:2",
+    "section:3",
+    "section:4",
+    "section:5",
+    "section:6",
+    "section:9",
+    "section:10",
+    "section:7",
+    "section:8",
+]
+
+[[rust_types]]
+path = "wchar_t::wchar_t"
+c_only_reason = "Guard markers and __WCHAR_TYPE__ preserve C/C++ compiler type ownership."
+c_bindings = { wint_t = "wchar_t::wint_t", mbstate_t = "mbstate::mbstate_t" }
+c_declaration = '''
+#ifndef _WCHAR_T_DEFINED
+#define _WCHAR_T_DEFINED
+#ifndef __cplusplus
+typedef __WCHAR_TYPE__ wchar_t;
+#endif
+#endif
+
+#ifndef _WINT_T_DEFINED
+#define _WINT_T_DEFINED
+typedef int wint_t;
+#endif
+
+#ifndef _MBSTATE_T_DEFINED
+#define _MBSTATE_T_DEFINED
+/** @brief Conversion state for the restartable multibyte functions. */
+typedef struct {
+    int __count;       /**< Number of pending bytes.            */
+    unsigned char __buf[4]; /**< Buffered bytes of an incomplete seq. */
+} mbstate_t;
+#endif'''
+
+[[rust_types]]
+path = "wchar_t::wint_t"
+emit = false
+
+[[rust_types]]
+path = "mbstate::mbstate_t"
+emit = false
+
+[[rust_constants]]
+path = "wchar_t::WEOF"
+c_only_reason = "NULL is a C null-pointer macro rather than a Rust constant ABI item."
+c_bindings = { WCHAR_MAX = "wchar_t::WCHAR_MAX", WCHAR_MIN = "wchar_t::WCHAR_MIN" }
+c_declaration = '''
+#ifndef WEOF
+#define WEOF ((wint_t)(-1))
+#endif
+
+#ifndef WCHAR_MAX
+#define WCHAR_MAX 0x7fffffff
+#endif
+
+#ifndef WCHAR_MIN
+#define WCHAR_MIN (-WCHAR_MAX - 1)
+#endif
+
+#ifndef NULL
+#define NULL ((void *)0)
+#endif'''
+no_comment = true
+
+[[rust_constants]]
+path = "wchar_t::WCHAR_MAX"
+emit = false
+
+[[rust_constants]]
+path = "wchar_t::WCHAR_MIN"
+emit = false
+
+[[sections]]
+title = "String Operations"
+functions = ["wcslen", "wcscpy", "wcsncpy", "wcscat"]
+
+[[sections]]
+title = "Comparison"
+functions = [
+    "wcscmp",
+    "wcsncmp",
+    "wcscoll",
+    "wcscoll_l",
+    "wcsxfrm",
+    "wcsxfrm_l",
+]
+
+[[sections]]
+title = "Search"
+functions = ["wcschr", "wcsrchr", "wcspbrk", "wcsstr", "wcstok"]
+
+[[sections]]
+title = "Numeric Conversions"
+functions = [
+    "wcstol",
+    "wcstoul",
+    "wcstoll",
+    "wcstoull",
+    "wcstod",
+    "wcstof",
+    "wcstold",
+]
+
+[[sections]]
+title = "Wide Memory Operations"
+functions = ["wmemcpy", "wmemmove", "wmemset", "wmemcmp", "wmemchr"]
+
+[[sections]]
+title = "Byte / Wide Conversion"
+functions = ["btowc", "wctob"]
+
+[[sections]]
+title = "Wide Character Formatted Output"
+functions = [
+    "swprintf",
+    "vswprintf",
+    "fwprintf",
+    "wprintf",
+    "vfwprintf",
+    "vwprintf",
+]
+
+[[sections]]
+title = "Restartable Multibyte / Wide Conversion"
+functions = [
+    "mbrtowc",
+    "wcrtomb",
+    "mbrlen",
+    "mbsinit",
+    "mbsrtowcs",
+    "mbsnrtowcs",
+    "wcsrtombs",
+    "wcsnrtombs",
+]
+
+[[sections]]
+title = "Wide Character Time"
+functions = ["wcsftime"]
+
+[[sections]]
+title = "Wide Character Stream I/O"
+functions = [
+    "fgetwc",
+    "getwc",
+    "getwchar",
+    "fputwc",
+    "putwc",
+    "putwchar",
+    "fgetws",
+    "fputws",
+    "ungetwc",
+]
+
+[[sections]]
+title = "Stream Orientation"
+functions = ["fwide"]
+
+[overrides]
+wcscoll = '''
+extern int wcscoll(const wchar_t *s1, const wchar_t *s2);'''
+wcscoll_l = '''
+extern int wcscoll_l(const wchar_t *s1, const wchar_t *s2, locale_t locale);'''
+wcsxfrm = '''
+extern size_t wcsxfrm(wchar_t *dest, const wchar_t *src, size_t n);'''
+wcsxfrm_l = '''
+extern size_t wcsxfrm_l(wchar_t *dest, const wchar_t *src, size_t n, locale_t locale);'''
+wcstok = '''
+extern wchar_t *wcstok(wchar_t *ws, const wchar_t *delim, wchar_t **ptr);'''
+wcsftime = '''
+extern size_t wcsftime(wchar_t *s, size_t maxsize, const wchar_t *format, const struct tm *timeptr);'''
+wmemchr = '''
+extern wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n);'''
+vswprintf = '''
+extern int vswprintf(wchar_t *ws, size_t n, const wchar_t *format, va_list ap);'''
+mbrtowc = '''
+extern size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps);'''
+wcrtomb = '''
+extern size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps);'''
+mbrlen = '''
+extern size_t mbrlen(const char *s, size_t n, mbstate_t *ps);'''
+mbsinit = '''
+extern int mbsinit(const mbstate_t *ps);'''
+mbsrtowcs = '''
+extern size_t mbsrtowcs(wchar_t *dest, const char **src, size_t n, mbstate_t *ps);'''
+mbsnrtowcs = '''
+extern size_t mbsnrtowcs(wchar_t *dest, const char **src, size_t nmc, size_t len, mbstate_t *ps);'''
+wcsrtombs = '''
+extern size_t wcsrtombs(char *dest, const wchar_t **src, size_t n, mbstate_t *ps);'''
+wcsnrtombs = '''
+extern size_t wcsnrtombs(char *dest, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps);'''
+wcstold = '''
+extern long double wcstold(const wchar_t *nptr, wchar_t **endptr);'''

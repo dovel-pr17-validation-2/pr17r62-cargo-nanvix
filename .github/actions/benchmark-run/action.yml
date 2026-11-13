@@ -1,0 +1,54 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Benchmark Run"
+description: "Run a set of micro-benchmarks"
+
+inputs:
+  benchmarks:
+    description: "Space-separated list of benchmark names to run"
+    required: true
+  machine-type:
+    description: "Target machine type"
+    required: true
+    default: "microvm"
+  iterations:
+    description: "Number of benchmark iterations"
+    required: true
+    default: "100"
+  payload-size:
+    description: "Optional echo payload size (warm-start-vmm minimum: 4)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Run Benchmarks"
+      shell: bash
+      env:
+        BENCHMARKS: ${{ inputs.benchmarks }}
+        MACHINE_TYPE: ${{ inputs.machine-type }}
+        ITERATIONS: ${{ inputs.iterations }}
+        PAYLOAD_SIZE: ${{ inputs.payload-size }}
+      run: |
+        for bench in ${BENCHMARKS}; do
+          payload_args=()
+          case "${bench}" in
+            warm-start-gateway|warm-start-vmm|warm-start-socket)
+              if [[ -n "${PAYLOAD_SIZE}" ]]; then
+                payload_args=(--payload-size "${PAYLOAD_SIZE}")
+              fi
+              ;;
+          esac
+
+          python3 ./scripts/benchmark.py \
+            run \
+            --benchmark "${bench}" \
+            --machine-type "${MACHINE_TYPE}" \
+            --hwloc "$HOME/hwloc.json" \
+            --iterations "${ITERATIONS}" \
+            "${payload_args[@]}" \
+            --output-dir "$(pwd)" \
+            --commit "${{ github.sha }}"
+        done

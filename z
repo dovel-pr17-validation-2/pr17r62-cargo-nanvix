@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+#
+# Thin wrapper that delegates to the unified Python build backend (z.py).
+#
+# Run './z help' for more information on how to use this utility.
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Ensure Python 3 is available.
+if ! command -v python3 &>/dev/null; then
+    echo "[ERROR] Python 3.10+ is required but 'python3' was not found on PATH." >&2
+    echo "        Run './z setup' or install Python manually." >&2
+    exit 1
+fi
+
+exec python3 "${SCRIPT_DIR}/z.py" "$@"
+

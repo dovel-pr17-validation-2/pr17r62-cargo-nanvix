@@ -1,0 +1,333 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Publish Release"
+description: "Publish a versioned release to GitHub"
+
+inputs:
+  github-token:
+    description: "GitHub token for creating releases"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Extract Version"
+      id: version
+      shell: bash
+      run: |
+        version=$(grep -m 1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+        if [ -z "${version}" ]; then
+          echo "Warning: Failed to extract version from Cargo.toml, using fallback"
+          version="?.?.?"
+        fi
+        echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+    - name: "Download release artifacts"
+      uses: actions/download-artifact@v7
+      with:
+        pattern: release-*
+        path: release-artifacts
+
+    - name: "Clean Up Stale Releases"
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+
+          // Clean up orphaned draft releases left behind by prior runs.
+          // All intentional releases are created with draft: false, so any
+          // draft release is stale by definition.
+          async function deleteStaleDraftReleases() {
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 }
+            );
+            const stale = releases.filter(r => r.draft);
+            for (const rel of stale) {
+              core.info(`Deleting stale draft release ${rel.id} (tag="${rel.tag_name}", name="${rel.name}").`);
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: rel.id });
+            }
+            if (stale.length === 0) {
+              core.info('No stale draft releases found.');
+            }
+          }
+
+          await deleteStaleDraftReleases();
+
+    - name: "Create Versioned Release"
+      uses: actions/github-script@v8
+      env:
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+          const version = process.env.RELEASE_VERSION;
+          const commitSha = context.sha;
+          const tag = `v${version}`;
+
+          // --- Semver helper ---
+          // Parse "MAJOR.MINOR.PATCH" into a comparable array.
+          function parseSemver(v) {
+            const parts = v.replace(/^v/, '').split('.').map(Number);
+            if (parts.length !== 3 || parts.some(isNaN)) return null;
+            return parts;
+          }
+
+          // Return true when `a` >= `b` (both are "M.m.p" strings).
+          function semverGte(a, b) {
+            const pa = parseSemver(a);
+            const pb = parseSemver(b);
+            if (!pa || !pb) return false;
+            for (let i = 0; i < 3; i++) {
+              if (pa[i] > pb[i]) return true;
+              if (pa[i] < pb[i]) return false;
+            }
+            return true; // equal
+          }
+
+          // Determine whether this release should be marked as "latest".
+          // Compare the version being published against the current latest
+          // release's version. This avoids the race where dev HEAD moves
+          // forward during the pipeline, which would cause a commit-SHA
+          // comparison to fail even for legitimate releases.
+          let shouldBeLatest = false;
+          try {
+            const { data: latest } = await github.rest.repos.getLatestRelease({ owner, repo });
+            const latestVersion = latest.tag_name;
+            shouldBeLatest = semverGte(version, latestVersion);
+            core.info(
+              `Current latest release is ${latestVersion}; ` +
+              `this release is ${tag}; shouldBeLatest=${shouldBeLatest}.`
+            );
+          } catch (error) {
+            if (error.status === 404) {
+              // No releases exist yet — this one should be latest.
+              shouldBeLatest = true;
+              core.info('No existing latest release found; this release will be latest.');
+            } else {
+              core.warning(`Failed to determine latest release: ${error.message}; defaulting to latest.`);
+              shouldBeLatest = true;
+            }
+          }
+
+          // --- Idempotency: check if this versioned release already exists ---
+
+          let release;
+          let alreadyExists = false;
+          try {
+            const { data } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            core.info(`Release ${tag} already exists (id=${data.id}); skipping creation.`);
+            release = data;
+            alreadyExists = true;
+          } catch (error) {
+            if (error.status !== 404) throw error;
+          }
+
+          if (alreadyExists) {
+            // If the existing release targets a different commit, skip gracefully.
+            // This happens on every human merge: the merge commit still has the
+            // old version from the previous bot push, so publish-release finds
+            // the release already created by that prior run. The bot's subsequent
+            // create-release push will bump the version and create a new one.
+            if (release.target_commitish !== commitSha) {
+              core.info(
+                `Release ${tag} already exists for commit ${release.target_commitish}; ` +
+                `this workflow is on ${commitSha}. ` +
+                `Skipping — release for this version was already published.`
+              );
+              return;
+            }
+          } else {
+            // --- Create the versioned tag ---
+
+            core.info(`Creating tag refs/tags/${tag} at ${commitSha}...`);
+            try {
+              await github.rest.git.createRef({
+                owner,
+                repo,
+                ref: `refs/tags/${tag}`,
+                sha: commitSha,
+              });
+              core.info(`Created tag refs/tags/${tag}.`);
+            } catch (error) {
+              if (error.status === 422) {
+                core.info(`Tag ${tag} already exists; verifying existing target commit...`);
+                let existing;
+                try {
+                  existing = await github.rest.git.getRef({
+                    owner,
+                    repo,
+                    ref: `tags/${tag}`,
+                  });
+                } catch (fetchError) {
+                  core.setFailed(
+                    `Failed to fetch existing tag ${tag} to verify immutability: ${fetchError.message}`
+                  );
+                  return;
+                }
+                const existingSha = existing.data.object.sha;
+                if (existingSha === commitSha) {
+                  core.info(`Tag ${tag} already exists and points to ${commitSha}; reusing existing tag.`);
+                } else {
+                  core.setFailed(
+                    `Tag ${tag} already exists at ${existingSha}, which differs from desired ${commitSha}. ` +
+                    "Refusing to retag immutable versioned tag. " +
+                    "Please verify the workflow run or manually resolve the tag conflict."
+                  );
+                  return;
+                }
+              } else {
+                throw error;
+              }
+            }
+
+            // --- Create the versioned release ---
+
+            core.info(`Creating release "Nanvix ${version}" at ${commitSha}...`);
+            try {
+              const { data: created } = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                target_commitish: commitSha,
+                name: `Nanvix ${version}`,
+                body: `Automated release for Nanvix ${version}.`,
+                draft: false,
+                prerelease: false,
+                make_latest: shouldBeLatest ? "true" : "false",
+              });
+              release = created;
+              core.info(`Created release ${release.id} (${release.html_url}).`);
+            } catch (error) {
+              if (error.status === 422) {
+                // Concurrent run already created this release — retrieve it.
+                core.info(`Release ${tag} was created concurrently; retrieving it.`);
+                const { data } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+                release = data;
+                if (release.target_commitish !== commitSha) {
+                  core.info(
+                    `Concurrent release ${tag} targets ${release.target_commitish}, ` +
+                    `not ${commitSha}. Skipping.`
+                  );
+                  return;
+                }
+              } else {
+                throw error;
+              }
+            }
+          }
+
+          // --- Upload release artifacts ---
+          // Runs on both new and existing releases so that re-runs recover
+          // from partial uploads. uploadAssetWithRetry handles already_exists.
+
+          async function deleteExistingAsset(releaseId, name) {
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner,
+              repo,
+              release_id: releaseId,
+              per_page: 100,
+            });
+            const existing = assets.find(a => a.name === name);
+            if (existing) {
+              core.info(`Deleting existing asset ${name} (id=${existing.id}) before retry...`);
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: existing.id,
+              });
+            }
+          }
+
+          async function uploadAssetWithRetry(releaseId, name, data, retries = 3) {
+            const contentType = name.endsWith('.zip')
+              ? 'application/zip'
+              : 'application/x-bzip2';
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                await github.rest.repos.uploadReleaseAsset({
+                  owner,
+                  repo,
+                  release_id: releaseId,
+                  name,
+                  data,
+                  headers: {
+                    'content-type': contentType,
+                    'content-length': data.length,
+                  },
+                });
+                return;
+              } catch (error) {
+                const isAlreadyExists = error.message && error.message.includes('already_exists');
+                if (attempt < retries) {
+                  const delay = attempt * 2000;
+                  core.warning(`Upload of ${name} failed (attempt ${attempt}/${retries}): ${error.message}. Retrying in ${delay}ms...`);
+                  if (isAlreadyExists) {
+                    await deleteExistingAsset(releaseId, name);
+                  }
+                  await new Promise(r => setTimeout(r, delay));
+                } else {
+                  throw error;
+                }
+              }
+            }
+          }
+
+          // Upload release artifacts (Linux .tar.bz2 and Windows .zip).
+          const globber = await glob.create('release-artifacts/**/*.tar.bz2\nrelease-artifacts/**/*.zip');
+          const files = await globber.glob();
+          core.info(`Found ${files.length} artifact(s) to upload.`);
+
+          for (const filePath of files) {
+            const name = path.basename(filePath);
+            const data = fs.readFileSync(filePath);
+            core.info(`Uploading ${name} (${data.length} bytes)...`);
+            await uploadAssetWithRetry(release.id, name, data);
+          }
+
+          // --- Verify the release is published ---
+
+          const { data: verify } = await github.rest.repos.getRelease({
+            owner,
+            repo,
+            release_id: release.id,
+          });
+
+          if (verify.draft) {
+            if (verify.tag_name !== tag) {
+              core.warning(
+                `Release ${release.id} has unexpected tag "${verify.tag_name}" ` +
+                `(expected "${tag}"); deleting and failing.`
+              );
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: release.id });
+              core.setFailed(
+                `Deleted release ${release.id} with wrong tag "${verify.tag_name}". ` +
+                `Next run will recreate it.`
+              );
+              return;
+            }
+
+            core.warning(`Release ${release.id} is unexpectedly a draft; attempting to publish...`);
+            const { data: patched } = await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              draft: false,
+              make_latest: shouldBeLatest ? "true" : "false",
+            });
+            if (patched.draft) {
+              core.setFailed(`Release ${release.id} is still a draft after recovery attempt.`);
+              return;
+            }
+            core.info(`Successfully recovered release ${release.id} from draft to published.`);
+          } else {
+            core.info(`Verified release ${release.id} is published (draft=${verify.draft}).`);
+          }

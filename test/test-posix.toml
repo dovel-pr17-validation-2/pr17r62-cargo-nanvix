@@ -1,0 +1,469 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+# Ported POSIX C test-suite configuration (Linux).
+#
+# Drives the suites built by build/make/posix-tests.mk through the nanvix-test
+# harness: each `<suite>.initrd` is booted under nanvixd in standalone mode (the
+# `terminal` executor) and the propagated guest exit code must match the suite's
+# `expected_exit_code`. Suites that must exit with 0 are checked by their exit code
+# alone. Suites that must be killed by a fault also assert a stdout marker, so that
+# a crash before the intended fault is not mistaken for a pass.
+#
+# Usage: nanvix-test.elf test/test-posix.toml
+
+[runner]
+nanvixd_binary_path = "./bin/nanvixd.elf"
+working_directory = "."
+log_directory = "logs"
+tmp_directory = "/tmp"
+ipv4_addr = "127.0.0.1"
+port_num = 9999
+fatal = true
+toolchain_path = "toolchain"
+sysroot_path = "./sysroot"
+nanvixd_shutdown_attempts_max = 10
+nanvixd_shutdown_retry_interval_ms = 100
+nanvixd_ready_attempts_max = 50
+nanvixd_ready_retry_interval_ms = 100
+cleanup_uservm_sleep_duration_ms = 10
+stream_collection_timeout_ms = 300000
+gateway_connect_max_attempts = 100
+gateway_connect_initial_backoff_ms = 10
+gateway_connect_max_backoff_ms = 500
+gateway_connect_timeout_ms = 15000
+
+#===================================================================================================
+# Ported POSIX C Test Suites (standalone, exit-code-only)
+#===================================================================================================
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-bindings"
+program = "./bin/test-c-bindings.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-cxa-atexit"
+program = "./bin/test-c-cxa-atexit.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-ctor"
+program = "./bin/test-c-ctor.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn"
+program = "./bin/test-c-dlfcn.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-ctor-dtor-reentry"
+program = "./bin/test-c-dlfcn-ctor-dtor-reentry.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-ctor-dtor-reentry.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-cycle"
+program = "./bin/test-c-dlfcn-cycle.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-cycle.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-diamond"
+program = "./bin/test-c-dlfcn-diamond.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-diamond.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-dlclose-cycle"
+program = "./bin/test-c-dlfcn-dlclose-cycle.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-dlclose-cycle.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-dtor-reentry"
+program = "./bin/test-c-dlfcn-dtor-reentry.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-dtor-reentry.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-global"
+program = "./bin/test-c-dlfcn-global.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-global.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-handle-reuse"
+program = "./bin/test-c-dlfcn-handle-reuse.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-handle-reuse.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-hash"
+program = "./bin/test-c-dlfcn-hash.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-hash.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-hello"
+program = "./bin/test-c-dlfcn-hello.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-hello.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-init-concurrent"
+program = "./bin/test-c-dlfcn-init-concurrent.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-init-concurrent.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-init-runpath"
+program = "./bin/test-c-dlfcn-init-runpath.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-init-runpath.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-initfini"
+program = "./bin/test-c-dlfcn-initfini.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-initfini.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-needed"
+program = "./bin/test-c-dlfcn-needed.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-needed.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-order"
+program = "./bin/test-c-dlfcn-order.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-order.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-pie"
+program = "./bin/test-c-dlfcn-pie.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-refcount"
+program = "./bin/test-c-dlfcn-refcount.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-scope"
+program = "./bin/test-c-dlfcn-scope.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-scope.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-searchpath"
+program = "./bin/test-c-dlfcn-searchpath.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-searchpath.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-selflink"
+program = "./bin/test-c-dlfcn-selflink.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-selflink.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-staging"
+program = "./bin/test-c-dlfcn-staging.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-staging.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-startup"
+program = "./bin/test-c-dlfcn-startup.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-startup.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-dlfcn-weak"
+program = "./bin/test-c-dlfcn-weak.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-dlfcn-weak.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-echo"
+program = "./bin/test-c-echo.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-exec-signals"
+program = "./bin/test-c-exec-signals.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-exec-signals.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-execvp"
+program = "./bin/test-c-execvp.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs-test-c-execvp.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-file"
+program = "./bin/test-c-file.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img -mount ./bin/posix-tests-ramfs-seed"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-fork-pid"
+program = "./bin/test-c-fork-pid.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-fork-pthread"
+program = "./bin/test-c-fork-pthread.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-glob"
+program = "./bin/test-c-glob.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-headers"
+program = "./bin/test-c-headers.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-hello"
+program = "./bin/test-c-hello.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-inet"
+program = "./bin/test-c-inet.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-libgen"
+program = "./bin/test-c-libgen.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-memory"
+program = "./bin/test-c-memory.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-misc"
+program = "./bin/test-c-misc.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-netdb"
+program = "./bin/test-c-netdb.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-network"
+program = "./bin/test-c-network.initrd"
+extra_nanvixd_args = "-allow-host-networking -mount ./bin/n"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-noop"
+program = "./bin/test-c-noop.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-regex"
+program = "./bin/test-c-regex.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-send"
+program = "./bin/test-c-send.initrd"
+extra_nanvixd_args = "-allow-host-networking"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-setjmp"
+program = "./bin/test-c-setjmp.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-signal-rpc"
+program = "./bin/test-c-signal-rpc.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-sigmask"
+program = "./bin/test-c-sigmask.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-stdio"
+program = "./bin/test-c-stdio.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-termios"
+program = "./bin/test-c-termios.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-thread"
+program = "./bin/test-c-thread.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-locale"
+program = "./bin/test-c-locale.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-math"
+program = "./bin/test-c-math.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-posix-timers"
+program = "./bin/test-c-posix-timers.initrd"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-wchar"
+program = "./bin/test-c-wchar.initrd"
+extra_nanvixd_args = "-ramfs ./bin/posix-tests-ramfs.img"
+expected_exit_code = 0
+
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-pathconf"
+program = "./bin/test-c-pathconf.initrd"
+expected_exit_code = 0
+
+#===================================================================================================
+# Ported POSIX C Test Suites (standalone, killed by a fault)
+#===================================================================================================
+
+# test-c-mprotect drops write access to a range with mprotect(PROT_READ) and then writes to it. The
+# fault is left unhandled, so the suite must be killed with exit status 4 (EINTR). It prints "ok"
+# right before that write, so a crash in an earlier step, which also exits with status 4, fails.
+[[tests]]
+build_modes = ["debug", "release"]
+executor = "terminal"
+name = "posix/test-c-mprotect"
+program = "./bin/test-c-mprotect.initrd"
+expected_output = "ok"
+expected_exit_code = 4

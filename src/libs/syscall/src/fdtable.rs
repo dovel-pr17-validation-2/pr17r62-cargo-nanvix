@@ -1,0 +1,455 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//! Client-side file-descriptor resolution cache.
+//!
+//! Under the flat namespace a descriptor's number no longer encodes its backend: `open` hands out
+//! the lowest free number (typically a small one), so a value like `4` could be a regular file, a
+//! pipe end, a directory, a host file, or a socket. Every descriptor is whatever `vfsd`'s
+//! authoritative slot table says it is.
+//!
+//! This module routes a descriptor through a single seam, [`resolve`]. The answer comes from, in
+//! order: a coherent cache entry; otherwise an authoritative query to `vfsd` ([`resolve_via_vfsd`]).
+//! If no guest `vfsd` exists, the standard streams fall back to the kernel
+//! console by number. A descriptor created locally (`open`, `pipe`, `socket`) or learned from
+//! `vfsd` is recorded, so the `vfsd` query is reached only on a genuine miss or after an entry goes
+//! stale.
+//!
+//! Coherence is load-bearing here. Each entry carries the `vfsd` table generation it was learned at
+//! (its *epoch*), and [`EXPECTED_EPOCH`] tracks the newest generation this process has observed from
+//! `vfsd`. An entry older than that ([`is_coherent`]) is treated as stale and re-resolved, so a
+//! number reused for a different backend can never be answered from an outdated entry.
+
+// Host unit tests cannot perform the real `vfsd` IPC, so they supply a stand-in.
+#[cfg(test)]
+use self::tests::resolve_via_vfsd;
+pub(crate) use crate::fd_route::Route;
+use ::alloc::collections::BTreeMap;
+use ::core::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
+use ::spin::Mutex;
+use ::sys::error::Error;
+use ::sysapi::unistd::{
+    STDERR_FILENO,
+    STDIN_FILENO,
+    STDOUT_FILENO,
+};
+
+//==================================================================================================
+// Structures
+//==================================================================================================
+
+/// A resolved routing decision: which backend serves a descriptor and the descriptor number that
+/// backend expects.
+///
+/// `backend_fd` may differ from the descriptor passed to [`resolve`]: a console descriptor reports
+/// the standard stream number it aliases (`0`/`1`/`2`), and a socket reports the descriptor
+/// `networkd` assigned. Call sites address their backend through `backend_fd` rather than the
+/// caller-facing number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Resolution {
+    /// The backend that serves the descriptor.
+    pub route: Route,
+    /// The descriptor number the backend expects.
+    pub backend_fd: i32,
+}
+
+/// Result of resolving a descriptor specifically for console I/O.
+pub(crate) enum ConsoleLookup {
+    /// The descriptor is a console stream.
+    Console {
+        /// The standard stream number (`0`/`1`/`2`) represented by the descriptor.
+        backend_fd: i32,
+        /// Whether the descriptor is backed by an authoritative vfsd slot.
+        via_vfsd: bool,
+    },
+    /// The descriptor exists, but is not a console stream.
+    Other,
+    /// The descriptor does not exist.
+    BadFile,
+}
+
+/// A cached resolution together with the `vfsd` table generation it was learned at.
+#[derive(Debug, Clone, Copy)]
+struct CacheEntry {
+    /// The backend that serves the descriptor.
+    route: Route,
+    /// The descriptor number the backend expects.
+    backend_fd: i32,
+    /// The `vfsd` table generation this entry was learned at (its coherence epoch).
+    epoch: u64,
+}
+
+/// Outcome of asking `vfsd` for an authoritative descriptor route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VfsdResolution {
+    /// `vfsd` returned an authoritative route.
+    Hit(Resolution),
+    /// `vfsd` answered and reported that the descriptor has no slot.
+    BadFile,
+    /// The query could not be delivered or answered because no `vfsd` is available.
+    Unavailable,
+}
+
+//==================================================================================================
+// Cache
+//==================================================================================================
+
+/// The process-wide resolution cache, keyed by descriptor number.
+///
+/// Guarded by a [`spin::Mutex`] held only for the duration of a single map operation so the hot
+/// `read`/`write` path is never blocked on anything but a peer lookup, and never allocates on a
+/// resolve.
+static CACHE: Mutex<BTreeMap<i32, CacheEntry>> = Mutex::new(BTreeMap::new());
+
+/// The newest `vfsd` table generation this process has observed.
+///
+/// Every `vfsd` answer that carries a generation ([`record`] from `open`/`pipe`, and the
+/// resolution query) advances this through [`observe_epoch`]. A cache entry learned at an older
+/// generation is stale ([`is_coherent`]) and must be re-resolved, because the descriptor it
+/// describes may since have been closed and the number reused for a different backend.
+static EXPECTED_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Records that `vfsd` has advanced its table generation to at least `epoch`.
+///
+/// Monotonic via a max, so an out-of-order or duplicated response can never move the observed
+/// generation backwards and resurrect a stale entry.
+fn observe_epoch(epoch: u64) {
+    EXPECTED_EPOCH.fetch_max(epoch, Ordering::Relaxed);
+}
+
+/// Derives the fallback console route when no guest `vfsd` is available.
+fn derive_console(fd: i32) -> Option<Resolution> {
+    if fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO {
+        Some(Resolution {
+            route: Route::Console,
+            backend_fd: fd,
+        })
+    } else {
+        None
+    }
+}
+
+/// Reports whether a cache entry learned at `entry_epoch` is still coherent with the authoritative
+/// `vfsd` table.
+///
+/// An entry is coherent only if it was learned no earlier than the newest generation this process
+/// has observed from `vfsd`. A descriptor-table mutation advances that generation, so an entry that
+/// predates the latest one is treated as stale and re-resolved, guaranteeing a reused number is
+/// never answered from an entry that described its previous occupant.
+fn is_coherent(entry_epoch: u64) -> bool {
+    entry_epoch >= EXPECTED_EPOCH.load(Ordering::Relaxed)
+}
+
+/// Resolves a descriptor to its backend route.
+///
+/// This is the hot-path lookup used by every descriptor system call. The answer comes from, in
+/// order: a cached entry that is still coherent; otherwise an authoritative query to `vfsd`
+/// ([`resolve_via_vfsd`]).
+/// A cache hit on a coherent entry holds the lock only across a single map probe and never
+/// round-trips, so tight `read`/`write` loops stay local.
+pub(crate) fn resolve_result(fd: i32) -> Result<Option<Resolution>, Error> {
+    Ok(resolve_for_poll(fd)?.map(|(resolution, _via_vfsd)| resolution))
+}
+
+/// Resolves a descriptor for `poll()`, preserving errors and direct-console fallback routing.
+pub(crate) fn resolve_for_poll(fd: i32) -> Result<Option<(Resolution, bool)>, Error> {
+    {
+        let cache: ::spin::MutexGuard<'_, BTreeMap<i32, CacheEntry>> = CACHE.lock();
+        if let Some(entry) = cache.get(&fd) {
+            if is_coherent(entry.epoch) {
+                return Ok(Some((
+                    Resolution {
+                        route: entry.route,
+                        backend_fd: entry.backend_fd,
+                    },
+                    true,
+                )));
+            }
+        }
+    }
+    // The cache missed or went stale; the authority decides, falling back to the console by number
+    // only when no guest `vfsd` is available to answer.
+    match resolve_via_vfsd(fd)? {
+        VfsdResolution::Hit(resolution) => Ok(Some((resolution, true))),
+        VfsdResolution::BadFile => Ok(None),
+        VfsdResolution::Unavailable => Ok(derive_console(fd).map(|resolution| (resolution, false))),
+    }
+}
+
+/// Resolves `fd` for console I/O and reports whether vfsd owns the descriptor slot.
+pub(crate) fn resolve_console(fd: i32) -> Result<ConsoleLookup, Error> {
+    {
+        let cache: ::spin::MutexGuard<'_, BTreeMap<i32, CacheEntry>> = CACHE.lock();
+        if let Some(entry) = cache.get(&fd) {
+            if is_coherent(entry.epoch) {
+                return Ok(if entry.route == Route::Console {
+                    ConsoleLookup::Console {
+                        backend_fd: entry.backend_fd,
+                        via_vfsd: true,
+                    }
+                } else {
+                    ConsoleLookup::Other
+                });
+            }
+        }
+    }
+
+    Ok(match resolve_via_vfsd(fd)? {
+        VfsdResolution::Hit(resolution) if resolution.route == Route::Console => {
+            ConsoleLookup::Console {
+                backend_fd: resolution.backend_fd,
+                via_vfsd: true,
+            }
+        },
+        VfsdResolution::Hit(_) => ConsoleLookup::Other,
+        VfsdResolution::BadFile => ConsoleLookup::BadFile,
+        VfsdResolution::Unavailable => match derive_console(fd) {
+            Some(resolution) => ConsoleLookup::Console {
+                backend_fd: resolution.backend_fd,
+                via_vfsd: false,
+            },
+            None => ConsoleLookup::BadFile,
+        },
+    })
+}
+
+/// Resolves `fd` and returns the descriptor expected by `vfsd`.
+///
+/// File-descriptor-taking VFS syscalls must reject console, socket, and invalid descriptors rather
+/// than sending the caller-facing number directly to `vfsd`.
+pub(crate) fn resolve_vfs(fd: i32, syscall_name: &str) -> Result<i32, Error> {
+    use ::sys::error::ErrorCode;
+
+    match resolve_result(fd)? {
+        Some(resolution) if matches!(resolution.route, Route::Vfs | Route::Terminal) => {
+            Ok(resolution.backend_fd)
+        },
+        _ => {
+            ::syslog::warn!("{syscall_name}(): bad file descriptor fd={fd}");
+            Err(Error::new(ErrorCode::BadFile, "fd is not a VFS fd"))
+        },
+    }
+}
+
+/// Resolves `fd` and returns the `networkd` descriptor backing the socket.
+///
+/// Socket I/O syscalls take a flat descriptor but must address `networkd` by the descriptor it
+/// assigned (the backend fd). This consults the resolution cache (querying
+/// `vfsd` on a miss); a descriptor that is not a socket is rejected with `ENOTSOCK`. The flat
+/// descriptor never reaches `networkd`.
+pub(crate) fn resolve_socket(fd: i32, syscall_name: &str) -> Result<i32, Error> {
+    use ::sys::error::ErrorCode;
+
+    match resolve_result(fd)? {
+        Some(resolution) if resolution.route == Route::Socket => Ok(resolution.backend_fd),
+        _ => {
+            ::syslog::warn!("{syscall_name}(): not a socket fd={fd}");
+            Err(Error::new(ErrorCode::NotSocketFile, "fd is not a socket"))
+        },
+    }
+}
+
+/// Resolves `fd` for an operation that `vfsd` serves on its flat slot table itself — the descriptor
+/// flag queries (`fcntl(F_GETFD/F_SETFD/F_GETFL/F_SETFL)`) and the descriptor duplication family
+/// (`dup`/`dup2`/`fcntl(F_DUPFD)`).
+///
+/// Unlike [`resolve_vfs`], this accepts a console descriptor as well as a `vfsd`-served one, and it
+/// returns the *caller-facing flat descriptor* rather than the resolved `backend_fd`. That
+/// distinction matters for the console: its `backend_fd` is the standard stream number used to
+/// route I/O to the kernel, but these operations act on the slot `vfsd` owns, which is addressed by
+/// the flat number. Sockets and unknown descriptors are rejected (socket participation in this
+/// table lands in a later plan).
+pub(crate) fn resolve_table_op(fd: i32, syscall_name: &str) -> Result<i32, Error> {
+    use ::sys::error::ErrorCode;
+
+    match resolve_result(fd)? {
+        Some(resolution)
+            if matches!(resolution.route, Route::Vfs | Route::Console | Route::Terminal) =>
+        {
+            Ok(fd)
+        },
+        _ => {
+            ::syslog::warn!("{syscall_name}(): bad file descriptor fd={fd}");
+            Err(Error::new(ErrorCode::BadFile, "fd is not a vfsd table descriptor"))
+        },
+    }
+}
+
+/// Resolves `fd` for `fstat` and returns the flat descriptor that `vfsd` expects.
+///
+/// `vfsd` answers `fstat` from the slot it owns for every descriptor in its table, and synthesizes
+/// the metadata of console, terminal, and socket descriptors. Like [`resolve_table_op`], this
+/// returns the *caller-facing flat descriptor* rather than the resolved `backend_fd`, because the
+/// slot is the operand: the `backend_fd` of a console is the standard stream number used to route
+/// its I/O, and that of a socket is the descriptor `networkd` assigned, so neither names the slot.
+/// Unlike [`resolve_table_op`], this accepts sockets. An unknown descriptor is rejected with
+/// `EBADF`.
+pub(crate) fn resolve_stat(fd: i32, syscall_name: &str) -> Result<i32, Error> {
+    use ::sys::error::ErrorCode;
+
+    match resolve_result(fd)? {
+        Some(Resolution {
+            route: Route::Vfs | Route::Console | Route::Terminal | Route::Socket,
+            ..
+        }) => Ok(fd),
+        None => {
+            ::syslog::warn!("{syscall_name}(): bad file descriptor fd={fd}");
+            Err(Error::new(ErrorCode::BadFile, "fd is not a valid descriptor"))
+        },
+    }
+}
+
+/// Resolves `fd` for a terminal-control `ioctl` request (`TCGETS`/`TCSETS`/`TIOCGWINSZ`/
+/// `TIOCSWINSZ`) and returns the flat descriptor `vfsd` expects.
+///
+/// A descriptor is a terminal when it resolves to a direct console or vfsd terminal route. It is
+/// returned unchanged because vfsd owns terminal state keyed by the flat number; a valid
+/// non-terminal descriptor is rejected with `ENOTTY`, and an unknown descriptor with `EBADF`.
+/// This is the ioctl counterpart of [`resolve_socket`] and [`resolve_vfs`], the "new resolver arm"
+/// for terminal probing.
+pub(crate) fn resolve_tty(fd: i32, syscall_name: &str) -> Result<i32, Error> {
+    use ::sys::error::ErrorCode;
+
+    match resolve_result(fd)? {
+        Some(resolution) if matches!(resolution.route, Route::Console | Route::Terminal) => Ok(fd),
+        Some(_) => {
+            ::syslog::warn!("{syscall_name}(): fd is not a terminal fd={fd}");
+            Err(Error::new(ErrorCode::NotTerminal, "fd is not a terminal"))
+        },
+        None => {
+            ::syslog::warn!("{syscall_name}(): bad file descriptor fd={fd}");
+            Err(Error::new(ErrorCode::BadFile, "fd is not a valid descriptor"))
+        },
+    }
+}
+
+/// Records the resolution learned for `fd` from a backend response, stamped with the `epoch` the
+/// backend reported.
+///
+/// Called when a descriptor is created (`open`/`pipe`/`socket`) or learned from a `vfsd` resolution
+/// so the cache holds an authoritative entry rather than re-querying on every use. The reported
+/// generation also advances [`EXPECTED_EPOCH`], so an entry recorded now is coherent against the
+/// table state that produced it. An existing entry for `fd` is replaced.
+pub(crate) fn record(fd: i32, route: Route, backend_fd: i32, epoch: u64) {
+    observe_epoch(epoch);
+    CACHE.lock().insert(
+        fd,
+        CacheEntry {
+            route,
+            backend_fd,
+            epoch,
+        },
+    );
+}
+
+/// Queries `vfsd` for the authoritative route of `fd` and records the answer.
+///
+/// Reached only when the cache misses (or holds a stale entry) — i.e. for a `vfsd`-owned descriptor
+/// that this process did not itself create, or one whose entry went stale. The answer is recorded
+/// so subsequent uses hit the cache. Returns `None` if `vfsd` reports no slot for `fd` (an invalid
+/// descriptor).
+#[cfg(not(test))]
+fn resolve_via_vfsd(fd: i32) -> Result<VfsdResolution, Error> {
+    use crate::{
+        unistd::message::{
+            ResolveFdRequest,
+            ResolveFdResponse,
+        },
+        SystemCallMessage,
+        SystemCallMessageKind,
+    };
+    use ::sys::{
+        ipc::{
+            Message,
+            RequestToken,
+        },
+        pm::ThreadIdentifier,
+    };
+
+    let tid: ThreadIdentifier = match ::sys::kcall::pm::__kcall_gettid() {
+        Ok(tid) => tid,
+        Err(_) => return Ok(VfsdResolution::Unavailable),
+    };
+    let pid: ::sys::pm::ProcessIdentifier = match ::sys::kcall::pm::getpid() {
+        Ok(pid) => pid,
+        Err(_) => return Ok(VfsdResolution::Unavailable),
+    };
+    // A no-vfs image may assign the reserved vfsd pid to its workload. In that case a resolution
+    // request would loop back to the caller instead of reaching a descriptor authority.
+    if pid == crate::VFS_DESTINATION {
+        return Ok(VfsdResolution::Unavailable);
+    }
+
+    // Send the resolution query to vfsd and await its authoritative answer.
+    let mut request: Message =
+        ResolveFdRequest::build(tid, pid, fd, crate::VFS_DESTINATION, crate::VFS_MESSAGE_TYPE);
+    let token: RequestToken = match crate::rpc::send_request(&mut request) {
+        Ok(token) => token,
+        Err(_) => return Ok(VfsdResolution::Unavailable),
+    };
+    let mut interrupted: Option<Error> = None;
+    let response: Message = loop {
+        match crate::rpc::recv_response_interruptible(&token) {
+            Ok(response) => break response,
+            Err(error) if error.code == ::sys::error::ErrorCode::Interrupted => {
+                interrupted.get_or_insert(error);
+            },
+            Err(_) => return Ok(VfsdResolution::Unavailable),
+        }
+    };
+    if let Some(error) = interrupted {
+        return Err(error);
+    }
+
+    // A non-zero status means vfsd holds no slot for this descriptor: it is unroutable.
+    if response.status != 0 {
+        return Ok(VfsdResolution::BadFile);
+    }
+
+    let message: SystemCallMessage = match SystemCallMessage::try_from_bytes(response.payload) {
+        Ok(message) => message,
+        Err(_) => return Ok(VfsdResolution::BadFile),
+    };
+    let resolved: ResolveFdResponse = match message.kind() {
+        SystemCallMessageKind::ResolveFdResponse => ResolveFdResponse::from_bytes(message.payload),
+        _ => {
+            ::syslog::warn!("resolve_via_vfsd(): unexpected response header (fd={fd})");
+            return Ok(VfsdResolution::BadFile);
+        },
+    };
+    // `ResolveFdResponse` is `#[repr(C, packed)]`, so read each field through a raw pointer to avoid
+    // forming an unaligned reference (undefined behavior on targets that fault on misaligned loads).
+    let route_tag: u32 = unsafe { ::core::ptr::addr_of!(resolved.route).read_unaligned() };
+    let backend_fd: i32 = unsafe { ::core::ptr::addr_of!(resolved.backend_fd).read_unaligned() };
+    let epoch: u64 = unsafe { ::core::ptr::addr_of!(resolved.epoch).read_unaligned() };
+    let route: Route = match route_tag {
+        ResolveFdResponse::ROUTE_CONSOLE => Route::Console,
+        ResolveFdResponse::ROUTE_VFS => Route::Vfs,
+        ResolveFdResponse::ROUTE_SOCKET => Route::Socket,
+        ResolveFdResponse::ROUTE_TERMINAL => Route::Terminal,
+        other => {
+            ::syslog::warn!("resolve_via_vfsd(): unknown route tag {other} (fd={fd})");
+            return Ok(VfsdResolution::BadFile);
+        },
+    };
+    record(fd, route, backend_fd, epoch);
+    Ok(VfsdResolution::Hit(Resolution { route, backend_fd }))
+}
+
+/// Drops any cached resolution for `fd`.
+///
+/// Called when a descriptor is destroyed (`close`) so a number later reused by a different backend
+/// cannot be answered from a stale entry.
+pub(crate) fn invalidate(fd: i32) {
+    CACHE.lock().remove(&fd);
+}
+
+//==================================================================================================
+// Unit Tests
+//==================================================================================================
+
+#[cfg(test)]
+mod tests;

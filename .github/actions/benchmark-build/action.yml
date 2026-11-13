@@ -1,0 +1,28 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Benchmark Build"
+description: "Build Nanvix for benchmarking"
+
+inputs:
+  machine-type:
+    description: "Target machine type"
+    required: true
+    default: "microvm"
+runs:
+  using: "composite"
+  steps:
+    - name: "Build"
+      shell: bash
+      env:
+        MACHINE_TYPE: ${{ inputs.machine-type }}
+      run: |
+        ./z build \
+          -- \
+          all \
+          "MACHINE=${MACHINE_TYPE}" \
+          TARGET=x86 \
+          LOG_LEVEL=panic \
+          VERBOSE=yes \
+          RELEASE=yes \
+          ${SCCACHE:+"SCCACHE=${SCCACHE}"}

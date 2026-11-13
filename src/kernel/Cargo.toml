@@ -1,0 +1,88 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+[package]
+name = "kernel"
+version.workspace = true
+license-file.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Nanvix Kernel"
+homepage.workspace = true
+
+[[bin]]
+name = "kernel"
+path = "src/kmain.rs"
+
+[package.metadata.verus]
+verify = true
+
+[dependencies]
+arch = { workspace = true }
+vstd = { workspace = true }
+bitmap = { workspace = true }
+bump-allocator = { workspace = true }
+cfg-if = { workspace = true }
+error = { workspace = true, features = ["verus"] }
+cmdline = { workspace = true }
+config = { workspace = true, optional = true }
+koptions = { workspace = true }
+elf = { workspace = true }
+mmio-tag = { workspace = true }
+no_fail = { workspace = true }
+type-safe = { workspace = true }
+raw-array = { workspace = true }
+slab = { workspace = true }
+sorted-vec = { workspace = true }
+sys = { workspace = true }
+multibin = { workspace = true, optional = true }
+static_assert = { workspace = true }
+
+[build-dependencies]
+build-utils = { workspace = true }
+
+[features]
+default = ["microvm"]
+
+# Machine Types
+microvm = [
+    "arch/microvm",
+    "puts",
+    "stdio",
+    "pit",
+    "dep:config",
+    "dep:multibin",
+    "config/microvm",
+    "exception-stack-guard",
+]
+# Platform Features
+
+whp = ["config/whp"]
+smp = []
+pit = []
+putb = []
+puts = []
+stdio = []
+
+# Enables the dynamic exception stack guard.
+exception-stack-guard = []
+
+# Enables latest performance optimizations.
+nightly-performance-optimizations = []
+
+# Testing
+test = []
+
+# Interface Features
+kcall = []
+
+# Logging Features
+trace = ["debug"]
+debug = ["info"]
+info = ["warn"]
+warn = ["error"]
+error = ["panic"]
+panic = []
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Prepare Test Artifacts"
+description: "Download build artifacts, make binaries executable, and recreate
+  sysroot symlink"
+
+inputs:
+  build-type:
+    description: "Build type (debug or release)"
+    required: true
+  machine-type:
+    description: "Machine type"
+    required: true
+  target:
+    description: "Target architecture (e.g. x86, x86_64)"
+    required: false
+    default: "x86"
+  memory-size:
+    description: "Memory size in MB (default: 256)"
+    required: false
+    default: "256"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Download Build Artifacts"
+      uses: actions/download-artifact@v7
+      with:
+        name: ci-build-${{ inputs.build-type }}-${{ inputs.target }}-${{
+          inputs.machine-type }}-${{
+          inputs.memory-size }}mb
+        path: .
+
+    - name: "Make binaries executable"
+      shell: bash
+      run: chmod +x bin/*.elf 2>/dev/null || true
+
+    - name: "Recreate sysroot symlink"
+      if: inputs.machine-type == 'microvm'
+      shell: bash
+      run: |
+        # The sysroot symlink created during build uses an absolute path that
+        # is invalid on the self-hosted runner. Recreate it with a relative path.
+        rm -f sysroot
+        ln -sfn "sysroot-${{ inputs.build-type }}" sysroot

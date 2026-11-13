@@ -1,0 +1,114 @@
+/*
+ * Copyright(c) 2011-2024 The Maintainers of Nanvix.
+ * Licensed under the MIT License.
+ */
+
+OUTPUT_FORMAT("elf32-i386")
+ENTRY(_do_start)
+
+/*
+ * Page Size (4 KB)
+ */
+PAGE_SIZE = 0x1000;
+
+/*
+ * Platform base address.
+ *
+ * Physical address at which the VMM loads the guest binary.
+ */
+PLATFORM_BASE_ADDR = @PLATFORM_BASE_ADDR@;
+
+/*
+ * Boot Address
+ */
+BOOT_ADDR = 0x00100000 + PLATFORM_BASE_ADDR;
+
+/*
+ * Trampoline Address
+ *
+ * This is offset to 0x8000 for AP real-mode startup.
+ */
+TRAMPOLINE_ADDR = @TRAMPOLINE_ADDR@;
+
+/*
+ * Machine Reserved Space
+ *
+ * Space reserved after __KERNEL_END for machine-specific structures.
+ * This value is set by build.rs based on the target machine.
+ */
+MACHINE_RESERVED = @MACHINE_RESERVED@;
+
+ASSERT(TRAMPOLINE_ADDR >= PLATFORM_BASE_ADDR, "PLATFORM_BASE_ADDR exceeds TRAMPOLINE_ADDR")
+
+SECTIONS
+{
+	/* Start at the platform/VMM-defined load base. */
+	. = PLATFORM_BASE_ADDR;
+
+	/* Pad with zeroes up to the trampoline address. */
+	.zero : {
+		. = ABSOLUTE(TRAMPOLINE_ADDR);
+	} = 0
+
+    /* Trampoline section. */
+    .trampoline :
+    {
+    	KEEP(*(.trampoline))
+    }
+
+	. = BOOT_ADDR;
+
+	__KERNEL_START = .;
+	__TEXT_START = .;
+
+	/* Bootstrap section. */
+	.bootstrap :
+	{
+		__BOOTSTRAP_START = .;
+		KEEP(*(.bootstrap))
+		__BOOTSTRAP_END = .;
+	}
+
+	/* Text section. */
+	.text : ALIGN(PAGE_SIZE)
+	{
+		*(.text*)
+	}
+
+	__TEXT_END = .;
+
+	/* Initialized data section. */
+	.data : ALIGN(PAGE_SIZE)
+	{
+		__DATA_START = .;
+		*(.data*)
+		__DATA_END = .;
+	}
+
+	/* Read-only data section. */
+	.rodata : ALIGN(PAGE_SIZE)
+	{
+		__RODATA_START = .;
+		*(.rodata*)
+		__RODATA_END = .;
+	}
+
+	/* Uninitialized data section. */
+	.bss : ALIGN(PAGE_SIZE)
+	{
+		__BSS_START = .;
+		*(.bss*)
+		__BSS_END = .;
+	}
+
+	. = ALIGN(PAGE_SIZE);
+
+	__KERNEL_END = .;
+
+	/* Discarded. */
+	/DISCARD/ :
+	{
+		*(.comment)
+		*(.note)
+	}
+}

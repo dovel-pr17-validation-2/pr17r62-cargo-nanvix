@@ -1,0 +1,155 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for sys/mman.h.
+# Constants mirror src/libs/sysapi/src/sys_mman.rs; the function prototypes are
+# generated from the extern "C" signatures in the syscall crate.
+
+file = "sys/mman.h"
+brief = "Memory management declarations."
+description = """
+Declares the memory-mapping protection and flag constants and the mmap/munmap
+interfaces. Constants mirror the Rust definitions in the sysapi crate
+(sys_mman.rs)."""
+includes = ["sys/types.h"]
+guard = "_NANVIX_SYS_MMAN_H"
+scan_crates = ["syscall"]
+content_order = [
+    "rust_constants",
+    "section:0",
+    "section:1",
+    "section:2",
+    "section:3",
+    "section:4",
+]
+
+[[rust_constants]]
+path = "sys_mman::prot_flags::PROT_NONE"
+c_value = "0x0"
+comment = "Page cannot be accessed."
+
+[[rust_constants]]
+path = "sys_mman::prot_flags::PROT_READ"
+c_value = "0x1"
+comment = "Page can be read."
+
+[[rust_constants]]
+path = "sys_mman::prot_flags::PROT_WRITE"
+c_value = "0x2"
+comment = "Page can be written."
+
+[[rust_constants]]
+path = "sys_mman::prot_flags::PROT_EXEC"
+c_value = "0x4"
+comment = "Page can be executed."
+
+[[rust_constants]]
+path = "sys_mman::flags::MAP_SHARED"
+c_value = "0x01"
+comment = "Share changes."
+
+[[rust_constants]]
+path = "sys_mman::flags::MAP_PRIVATE"
+c_value = "0x02"
+comment = "Changes are private."
+
+[[rust_constants]]
+path = "sys_mman::flags::MAP_FIXED"
+c_value = "0x10"
+comment = "Interpret the address exactly."
+
+[[rust_constants]]
+path = "sys_mman::flags::MAP_ANONYMOUS"
+c_value = "0x20"
+comment = "Anonymous mapping (not backed by a file)."
+
+[[rust_constants]]
+path = "sys_mman::msync_flags::MS_ASYNC"
+c_value = "0x1"
+comment = "Perform asynchronous writes."
+
+[[rust_constants]]
+path = "sys_mman::msync_flags::MS_INVALIDATE"
+c_value = "0x2"
+comment = "Invalidate cached copies of mapped data."
+
+[[rust_constants]]
+path = "sys_mman::msync_flags::MS_SYNC"
+c_value = "0x4"
+comment = "Perform synchronous writes."
+
+[[rust_constants]]
+path = "sys_mman::memory_advice::MADV_NORMAL"
+c_value = "0"
+comment = "No special treatment."
+
+[[rust_constants]]
+path = "sys_mman::memory_advice::MADV_RANDOM"
+c_value = "1"
+comment = "Expect page references in random order."
+
+[[rust_constants]]
+path = "sys_mman::memory_advice::MADV_SEQUENTIAL"
+c_value = "2"
+comment = "Expect page references in sequential order."
+
+[[rust_constants]]
+path = "sys_mman::memory_advice::MADV_WILLNEED"
+c_value = "3"
+comment = "Expect access in the near future."
+
+[[rust_constants]]
+path = "sys_mman::memory_advice::MADV_DONTNEED"
+c_value = "4"
+comment = "Do not expect access in the near future."
+
+[[rust_constants]]
+path = "sys_mman::memory_advice::MADV_FREE"
+c_value = "8"
+comment = "Contents of the pages may be discarded."
+
+[[rust_constants]]
+path = "sys_mman::mlockall_flags::MCL_CURRENT"
+c_value = "0x1"
+comment = "Lock all currently mapped pages."
+
+[[rust_constants]]
+path = "sys_mman::mlockall_flags::MCL_FUTURE"
+c_value = "0x2"
+comment = "Lock all pages mapped in the future."
+
+[[rust_constants]]
+path = "sys_mman::MAP_FAILED"
+c_declaration = "\n/** @brief Returned by mmap() on failure. */\n#define MAP_FAILED ((void *)-1)"
+no_comment = true
+
+[[sections]]
+title = "Memory Mapping"
+functions = ["mmap", "munmap"]
+
+[overrides]
+mmap = "extern void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);"
+munmap = "extern int munmap(void *addr, size_t length);"
+mprotect = "extern int mprotect(void *addr, size_t length, int prot);"
+mlock = "extern int mlock(const void *addr, size_t len);"
+munlock = "extern int munlock(const void *addr, size_t len);"
+mlockall = "extern int mlockall(int flags);"
+munlockall = "extern int munlockall(void);"
+msync = "extern int msync(void *addr, size_t length, int flags);"
+madvise = "extern int madvise(void *addr, size_t length, int advice);"
+
+[[sections]]
+title = "Memory Protection"
+functions = ["mprotect"]
+
+[[sections]]
+title = "Memory Locking"
+functions = ["mlock", "munlock", "mlockall", "munlockall"]
+
+[[sections]]
+title = "Memory Synchronization"
+functions = ["msync"]
+
+[[sections]]
+title = "Memory Advice"
+functions = ["madvise"]

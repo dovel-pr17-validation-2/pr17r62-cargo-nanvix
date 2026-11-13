@@ -1,0 +1,41 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+[package]
+name = "nanvix"
+version.workspace = true
+license-file.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "A crate for interacting with Nanvix"
+homepage.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+config = { workspace = true }
+hwloc = { workspace = true }
+nanvix-http = { workspace = true }
+nanvix-terminal = { workspace = true }
+nanvix-sandbox-config = { workspace = true }
+sys = { workspace = true, features = ["std"], optional = true }
+syscall = { workspace = true, features = ["std"], optional = true }
+syscomm = { workspace = true }
+syslog = { workspace = true, features = ["std"] }
+uservm = { workspace = true, optional = true }
+
+[features]
+default = ["microvm"]
+internal-api = ["sys", "syscall", "uservm"]
+gdb = ["nanvix-sandbox-config/gdb", "nanvix-http/gdb", "nanvix-terminal/gdb"]
+# Enables fine-grained time profiling.
+profile-time = ["nanvix-terminal/profile-time"]
+microvm = [
+    "config/microvm",
+    "nanvix-http/microvm",
+    "nanvix-terminal/microvm",
+    "uservm?/microvm",
+]
+whp = ["config/whp", "nanvix-http/whp", "nanvix-terminal/whp", "uservm?/whp"]
+
+[lints]
+workspace = true

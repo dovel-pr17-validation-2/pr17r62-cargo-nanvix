@@ -1,0 +1,71 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use crate::streams::FILE;
+use ::sysapi::ffi::c_int;
+
+//==================================================================================================
+// Standalone Functions
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Flushes any buffered output for the stream pointed to by `stream`. Since this implementation
+/// uses unbuffered I/O, this function is a no-op.
+///
+/// # Parameters
+///
+/// - `stream`: Pointer to the target [`FILE`] stream, or null to flush all open streams.
+///
+/// # Returns
+///
+/// Zero on success.
+///
+/// # Safety
+///
+/// This function is unsafe for API compatibility. When `stream` is non-null the caller must
+/// ensure that it points to a valid [`FILE`] structure.
+///
+/// # References
+///
+/// - <https://pubs.opengroup.org/onlinepubs/9799919799/functions/fflush.html>
+///
+#[cfg_attr(not(feature = "std"), unsafe(no_mangle))]
+pub unsafe extern "C" fn fflush(_stream: *mut FILE) -> c_int {
+    // No-op: this implementation uses unbuffered I/O.
+    // TODO (#2631): implement real flush semantics once `libc_stdio` supports stream buffering.
+    0
+}
+
+///
+/// # Description
+///
+/// Non-locking variant of [`fflush`]. Nanvix streams are single-threaded, so this is exactly
+/// equivalent to [`fflush`].
+///
+/// # Parameters
+///
+/// - `stream`: Pointer to the target [`FILE`] stream, or null to flush all open streams.
+///
+/// # Returns
+///
+/// Zero on success, or `EOF` (`-1`) on error.
+///
+/// # Safety
+///
+/// This function is unsafe because it dereferences raw pointers. The caller must ensure that
+/// `stream` is either null or points to a valid [`FILE`] structure.
+///
+/// # References
+///
+/// - <https://man7.org/linux/man-pages/man3/unlocked_stdio.3.html>
+///
+#[cfg_attr(not(feature = "std"), unsafe(no_mangle))]
+pub unsafe extern "C" fn fflush_unlocked(stream: *mut FILE) -> c_int {
+    fflush(stream)
+}

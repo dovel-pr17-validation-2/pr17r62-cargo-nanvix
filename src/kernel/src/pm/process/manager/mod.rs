@@ -1,0 +1,4581 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+mod r#unsafe;
+
+mod delivery;
+
+mod signal;
+
+#[cfg(feature = "test")]
+pub(crate) use delivery::new_test_delivery_sequence;
+pub(crate) use delivery::DeliverySequence;
+pub use signal::{
+    SigReturnFailure,
+    SignalDeliveryOutcome,
+    SyncSignalOutcome,
+};
+#[cfg(feature = "test")]
+pub(super) use test::test;
+
+#[cfg(feature = "test")]
+mod test;
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use self::delivery::{
+    DeliveryBroker,
+    LifecycleDisposal,
+};
+use crate::{
+    event::EventOwnership,
+    hal::{
+        self,
+        arch::ContextInformation,
+        io::{
+            AnyIoPort,
+            IoMemoryRegion,
+            IoPortWidth,
+            MmioTag,
+        },
+        mem::{
+            AccessPermission,
+            Address,
+            PageAligned,
+            PageRange,
+            VirtualAddress,
+        },
+        platform,
+    },
+    mm::{
+        elf::Elf32Fhdr,
+        kstack::KernelStack,
+        ustack::UserStack,
+        VirtMemoryManager,
+        Vmem,
+    },
+    pm::{
+        clock,
+        process::{
+            state::{
+                signal::{
+                    compute_blocked,
+                    default_action,
+                    DefaultAction,
+                    KillOutcome,
+                    SignalControl,
+                    SignalDisposition,
+                    UNBLOCKABLE,
+                },
+                InterruptedProcess,
+                PendingProcessTermination,
+                ProcessRef,
+                ProcessRefMut,
+                ProcessState,
+                RunnableProcess,
+                RunningProcess,
+                SleepingProcess,
+                ZombieProcess,
+                ZombieProcessTransition,
+            },
+            HarvestedProcess,
+            LifecycleCreationReservation,
+            LifecycleTerminationCredit,
+            ThreadLifecycleReservation,
+            ThreadLifecycleTerminationCredit,
+        },
+        sync::{
+            condvar::Condvar,
+            mutex::{
+                Mutex,
+                MutexGuard,
+            },
+        },
+        thread::{
+            InterruptReason,
+            PendingThreadTermination,
+            ReadyThread,
+            ThreadManager,
+            ThreadRef,
+            ThreadRefMut,
+            ZombieThread,
+        },
+    },
+};
+use ::alloc::{
+    boxed::Box,
+    collections::{
+        vec_deque::VecDeque,
+        LinkedList,
+    },
+    vec::Vec,
+};
+use ::arch::{
+    cpu::excp,
+    mem::PAGE_SIZE,
+};
+use ::config::memory_layout::{
+    USER_STACK_MIN_SIZE,
+    USER_STACK_SIZE,
+    USER_STACK_TOP_RAW,
+};
+use ::no_fail::no_fail;
+use ::sys::{
+    error::{
+        Error,
+        ErrorCode,
+    },
+    event::{
+        Event,
+        ProcessCreationInfo,
+        ProcessRole,
+        ProcessTerminationInfo,
+    },
+    ipc::{
+        Message,
+        MessageReceiver,
+    },
+    pm::{
+        Capability,
+        ConditionAddress,
+        MutexAddress,
+        ProcessIdentifier,
+        SigAction,
+        SigSet,
+        ThreadCreateArgs,
+        ThreadIdentifier,
+        SIGCONT,
+        SIGKILL,
+        SIGSTOP,
+        SIGTSTP,
+        SIGTTIN,
+        SIGTTOU,
+        SIG_MAX,
+    },
+    time::SystemTime,
+    ExitStatus,
+};
+use ::type_safe::NonEmptyVecDeque;
+
+//==================================================================================================
+// Exports
+//==================================================================================================
+
+pub use self::r#unsafe::ExceptionGuard;
+
+//==================================================================================================
+// Sleep Error
+//==================================================================================================
+
+#[derive(Debug)]
+pub enum SleepError {
+    Interrupted(InterruptReason),
+    Generic(Error),
+}
+
+//==================================================================================================
+// Post Action
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Action the signal-posting primitive (`kill()`) must take after evaluating a posted signal's
+/// disposition, once the borrow of the process manager has been released so the action can re-borrow
+/// it.
+///
+enum PostAction {
+    /// Nothing further to do (the signal was ignored or discarded).
+    None,
+    /// The signal's default action terminates the target.
+    Terminate,
+    /// A caught signal was posted: interrupt a blocked candidate thread so its blocking call reports
+    /// `EINTR` (or restarts) and the handler is delivered at the return-to-user checkpoint.
+    Interrupt,
+    /// A job-control stop signal with the default disposition was posted: suspend the target
+    /// process (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`).
+    Stop,
+}
+
+//==================================================================================================
+// Process Manager
+//==================================================================================================
+
+///
+/// # Description
+///
+/// A type that represents the process manager.
+///
+pub struct ProcessManager {
+    /// Is this platform interrupt capable?
+    interrupt_capable: bool,
+    /// Reason for the last interrupt.
+    interrupt_reason: Option<InterruptReason>,
+    /// Next process identifier.
+    next_pid: ProcessIdentifier,
+    /// Running process.
+    running: Option<RunningProcess>,
+    /// Ready processes.
+    ready: LinkedList<RunnableProcess>,
+    /// Suspended processes.
+    suspended: LinkedList<SleepingProcess>,
+    /// Interrupted processes.
+    interrupted: LinkedList<InterruptedProcess>,
+    /// Zombie processes.
+    zombies: LinkedList<ZombieProcess>,
+    /// Thread manager.
+    tm: ThreadManager,
+    /// Number of live processes (including the kernel process). A process slot is considered
+    /// occupied from creation until the corresponding zombie is buried (popped off the zombie
+    /// list). Used to enforce [`config::kernel::MAX_PROCESSES`].
+    live_count: usize,
+    /// Number of messages buffered (not yet consumed).
+    number_buffered_messages: usize,
+    /// Broker for ordered delivery-domain items.
+    delivery: DeliveryBroker,
+    /// Injects one process-creation preparation failure after lifecycle capacity is reserved.
+    #[cfg(feature = "test")]
+    fail_next_lifecycle_creation: bool,
+    /// Injects one thread-creation preparation failure after lifecycle capacity is reserved.
+    #[cfg(feature = "test")]
+    fail_next_thread_lifecycle_creation: bool,
+    /// Detached-thread zombies whose reaping was deferred because their
+    /// `ContextInformation` was still needed by an in-progress context switch.
+    deferred_reap: Vec<(ProcessIdentifier, ZombieThread)>,
+    /// Address spaces of images replaced by `execv()` whose reclamation was deferred because the
+    /// outgoing page directory was still the active one during the switch into the new image.
+    /// Drained by [`Self::reap_deferred`] once the switch has loaded the new page directory.
+    deferred_exec_vmem: Vec<Vmem>,
+    /// Process identifiers of the system daemons the kernel spawned directly (procd, memd, and the
+    /// like), recognized by program name at spawn time. Used to classify a process's
+    /// [`ProcessRole`] authoritatively even when a daemon occupies a process identifier that another
+    /// deployment would assign to the init workload — e.g. a deployment without a separate VFS
+    /// daemon lets the workload take the VFS daemon's conventional identifier.
+    ///
+    /// Recording the name alongside each PID lets the kernel detect a duplicate spawn of the same
+    /// daemon name (e.g. a misconfigured boot image, or a future spawn-by-name path): only the first
+    /// process to claim a given name is classified as that daemon, so a later duplicate is treated as
+    /// an init process rather than silently recorded as a daemon.
+    ///
+    /// Entries are never removed. This is sound only because process identifiers are never
+    /// recycled: since the role also authorizes capability acquisition, a recycled daemon identifier
+    /// would otherwise let an unrelated process inherit the daemon's authority.
+    daemon_pids: Vec<(&'static str, ProcessIdentifier)>,
+}
+
+/// A process built during the fallible phase of creation, held in a queue node that was allocated
+/// there so the commit phase can install the termination credit and enqueue it without allocating.
+struct PreparedProcess {
+    node: LinkedList<RunnableProcess>,
+}
+
+impl PreparedProcess {
+    ///
+    /// # Description
+    ///
+    /// Moves a newly built process into its own queue node.
+    ///
+    /// # Parameters
+    ///
+    /// - `process`: Process to hold in the prepared queue node.
+    ///
+    /// # Returns
+    ///
+    /// A prepared process wrapping `process` in a single queue node.
+    ///
+    fn new(process: RunnableProcess) -> Self {
+        let mut node: LinkedList<RunnableProcess> = LinkedList::new();
+        node.push_back(process);
+        Self { node }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Installs the capacity credit reserved for this process's termination record.
+    ///
+    /// # Parameters
+    ///
+    /// - `credit`: The capacity credit to install for the process's future termination record.
+    ///
+    fn install_termination_credit(&mut self, credit: LifecycleTerminationCredit) {
+        match self.node.front_mut() {
+            Some(process) => process.install_termination_credit(credit),
+            None => unreachable!("prepared process node is empty"),
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Installs the capacity credit reserved for the prepared process's main thread termination.
+    ///
+    /// # Parameters
+    ///
+    /// - `credit`: Capacity credit to install in the prepared process's main thread.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the prepared process node is empty or the thread already owns a
+    /// termination credit.
+    ///
+    fn install_thread_termination_credit(&mut self, credit: ThreadLifecycleTerminationCredit) {
+        match self.node.front_mut() {
+            Some(process) => process.install_thread_termination_credit(credit),
+            None => unreachable!("prepared process node is empty"),
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Appends this process to a queue of ready processes.
+    ///
+    /// # Parameters
+    ///
+    /// - `ready`: Queue of ready processes to append onto.
+    ///
+    fn enqueue(mut self, ready: &mut LinkedList<RunnableProcess>) {
+        ready.append(&mut self.node);
+    }
+}
+
+impl ProcessManager {
+    ///
+    /// # Description
+    ///
+    /// Initializes the process manager and preallocates lifecycle delivery capacity.
+    ///
+    /// # Parameters
+    ///
+    /// - `interrupt_capable`: Indicates whether the process manager is interrupt capable.
+    /// - `kernel`: Kernel process.
+    /// - `root`: Root virtual memory.
+    /// - `tm`: Thread manager.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the initialized process manager is returned. Otherwise, an error is returned.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if lifecycle delivery capacity cannot be preallocated.
+    ///
+    pub fn new(
+        interrupt_capable: bool,
+        kernel: ReadyThread,
+        root: Vmem,
+        tm: ThreadManager,
+    ) -> Result<Self, Error> {
+        let delivery: DeliveryBroker = DeliveryBroker::new()?;
+        let kernel: RunnableProcess = RunnableProcess::new_kernel(
+            ProcessIdentifier::KERNEL,
+            ProcessIdentifier::KERNEL,
+            kernel,
+            root,
+        );
+
+        let (kernel, reason, _, _user_tda): (
+            RunningProcess,
+            Option<InterruptReason>,
+            *mut ContextInformation,
+            Option<VirtualAddress>,
+        ) = kernel.run();
+        debug_assert!(reason.is_none(), "kernel process should not be interrupted");
+
+        Ok(Self {
+            interrupt_capable,
+            interrupt_reason: None,
+            next_pid: ProcessIdentifier::from(1),
+            ready: LinkedList::new(),
+            suspended: LinkedList::new(),
+            interrupted: LinkedList::new(),
+            zombies: LinkedList::new(),
+            running: Some(kernel),
+            tm,
+            live_count: 1,
+            number_buffered_messages: 0,
+            delivery,
+            #[cfg(feature = "test")]
+            fail_next_lifecycle_creation: false,
+            #[cfg(feature = "test")]
+            fail_next_thread_lifecycle_creation: false,
+            deferred_reap: Vec::new(),
+            deferred_exec_vmem: Vec::new(),
+            daemon_pids: Vec::new(),
+        })
+    }
+
+    /// Classifies the [`ProcessRole`] of a process from its identifier and parent, using the set of
+    /// daemon identifiers recorded at spawn time. A process the kernel spawned as a system daemon is
+    /// always [`ProcessRole::Daemon`], regardless of the identifier it received; a non-daemon
+    /// process spawned by the kernel is the init process; anything else was forked by a user
+    /// process.
+    fn classify_role(&self, pid: ProcessIdentifier, parent: ProcessIdentifier) -> ProcessRole {
+        ProcessRole::classify(parent, self.daemon_pids.iter().any(|(_, p)| *p == pid))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Determines whether a process with a given [`ProcessRole`] may acquire capabilities.
+    ///
+    /// The role derives only from state that the kernel fixes when it creates a process (its
+    /// identifier, its parent, and the daemon identifiers recorded at spawn time), so a process
+    /// cannot change its own role and therefore cannot authorize itself to acquire capabilities.
+    ///
+    /// # Parameters
+    ///
+    /// - `role`: Role of the process.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a process with the given role may acquire capabilities, otherwise `false`.
+    ///
+    fn may_acquire_capabilities(role: ProcessRole) -> bool {
+        match role {
+            // The kernel spawns the init process and the system daemons directly from the boot
+            // image, so they are trusted to acquire the capabilities they need. The kernel process
+            // also classifies as the init process.
+            ProcessRole::Init | ProcessRole::Daemon => true,
+            // A process forked from a user process is never trusted to escalate its privileges.
+            ProcessRole::User => false,
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Runs fallible process-creation preparation while holding lifecycle capacity for the process
+    /// creation, process termination, and main-thread termination records.
+    ///
+    /// If preparation fails, this function releases the reservation before returning the error.
+    /// Sequence allocation is deferred until the caller commits the prepared process.
+    ///
+    /// `prepare` owns the cleanup of everything it allocates. In particular, no fallible step may
+    /// be added after the new user image is built unless it also reclaims that image's user frames,
+    /// which dropping a [`Vmem`] does not do.
+    ///
+    /// # Parameters
+    ///
+    /// - `prepare`: Fallible process preparation to run while capacity is reserved.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the process and thread reservations and prepared value are returned.
+    /// Otherwise, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if lifecycle capacity cannot be reserved or if `prepare`
+    /// fails.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if lifecycle delivery was already disposed.
+    ///
+    fn prepare_lifecycle_creation<T, F>(
+        &mut self,
+        prepare: F,
+    ) -> Result<(LifecycleCreationReservation, ThreadLifecycleReservation, T), Error>
+    where
+        F: FnOnce(&mut Self) -> Result<T, Error>,
+    {
+        let reservation: LifecycleCreationReservation = self.delivery.try_reserve_creation()?;
+        let thread_reservation: ThreadLifecycleReservation =
+            match self.delivery.try_reserve_thread_creation() {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    self.delivery.cancel_creation(reservation);
+                    return Err(error);
+                },
+            };
+        match prepare(self) {
+            Ok(prepared) => Ok((reservation, thread_reservation, prepared)),
+            Err(error) => {
+                self.delivery.cancel_thread_creation(thread_reservation);
+                self.delivery.cancel_creation(reservation);
+                Err(error)
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Runs fallible thread preparation while holding its termination-record capacity.
+    ///
+    /// # Parameters
+    ///
+    /// - `prepare`: Fallible thread preparation to run while capacity is reserved.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the thread reservation and prepared value are returned. Otherwise, an error
+    /// is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if thread lifecycle capacity cannot be reserved, a test
+    /// failure is injected, or `prepare` fails.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if lifecycle delivery was already disposed.
+    ///
+    fn prepare_thread_lifecycle_creation<T, F>(
+        &mut self,
+        prepare: F,
+    ) -> Result<(ThreadLifecycleReservation, T), Error>
+    where
+        F: FnOnce(&mut Self) -> Result<T, Error>,
+    {
+        let reservation: ThreadLifecycleReservation =
+            self.delivery.try_reserve_thread_creation()?;
+        #[cfg(feature = "test")]
+        if core::mem::take(&mut self.fail_next_thread_lifecycle_creation) {
+            self.delivery.cancel_thread_creation(reservation);
+            return Err(Error::new(
+                ErrorCode::OutOfMemory,
+                "injected thread lifecycle creation failure",
+            ));
+        }
+        match prepare(self) {
+            Ok(prepared) => Ok((reservation, prepared)),
+            Err(error) => {
+                self.delivery.cancel_thread_creation(reservation);
+                Err(error)
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Fails once after process creation has reserved lifecycle capacity and identifiers. Compiles
+    /// to a no-op outside test builds.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, empty is returned. Otherwise, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an [`ErrorCode::OutOfMemory`] error when a failure has been injected.
+    ///
+    fn check_lifecycle_creation_injection(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "test")]
+        if core::mem::take(&mut self.fail_next_lifecycle_creation) {
+            return Err(Error::new(ErrorCode::OutOfMemory, "injected lifecycle creation failure"));
+        }
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Creates a new thread in the calling process.
+    ///
+    /// # Parameters
+    ///
+    /// - `pm`: Handler to the process manager.
+    /// - `mm`: Handler to the virtual memory manager.
+    /// - `user_stack`: User stack to use for the new thread.
+    /// - `user_fn`: User function to execute in the new thread.
+    /// - `arg0`: First argument to pass to the user function.
+    /// - `arg1`: Second argument to pass to the user function.
+    /// - `enable_interrupts`: Whether to enable interrupts in the new thread.
+    ///
+    /// # Returns
+    ///
+    /// On successful completion, this function returns the thread identifier of the newly created
+    /// thread.  On failure, it returns an error object that provides details about the failure.
+    ///
+    /// # Safety Notes
+    ///
+    /// - `user_stack_base` refers to a memory region that lies within the user address space, it is
+    ///   writable.
+    /// - `user_stack_size` is a multiple of `PAGE_SIZE`.
+    /// - `user_fn` lies within the user address space and points to an executable memory region.
+    ///
+    fn forge_user_context(
+        mm: &mut VirtMemoryManager,
+        vmem: &mut Vmem,
+        args: &ThreadCreateArgs,
+        enable_interrupts: bool,
+    ) -> Result<(KernelStack, ContextInformation), Error> {
+        trace!("args={args:?}, enable_interrupts={enable_interrupts:?}",);
+
+        unsafe extern "C" {
+            pub fn __leave_kernel_to_user_mode();
+        }
+
+        // Assert pre-conditions (these should have been checked by the caller).
+        debug_assert!(Vmem::is_user_region(args.user_stack_base, args.user_stack_size));
+        debug_assert!(Vmem::is_user_addr(args.user_fn));
+
+        let kernel_func: VirtualAddress =
+            VirtualAddress::from_raw_value(__leave_kernel_to_user_mode as *const () as usize);
+
+        // Alloc kernel pages for the kernel stack. If we fail beyond this point, `kernel_stack`
+        // gets dropped as soon as we exit this scope and underlying pages are released.
+        let kernel_stack: KernelStack = KernelStack::new(mm)?;
+
+        let cr3: usize = vmem.cr3_value()?;
+        let esp: usize = unsafe {
+            hal::arch::forge_user_stack(
+                kernel_stack.top().into_raw_value() as *mut u8,
+                args.user_stack_base.into_raw_value() + args.user_stack_size,
+                args.user_fn.into_raw_value(),
+                args.user_fn_arg0,
+                args.user_fn_arg1,
+                kernel_func.into_raw_value(),
+                enable_interrupts,
+            )
+        } as usize;
+        let esp0: usize = kernel_stack.top().into_raw_value();
+
+        trace!("cr3={:#x}, esp={:#x}, ebp={:#x}", cr3, esp, esp0);
+        let context: ContextInformation = ContextInformation::new(cr3, esp, esp0);
+
+        Ok((kernel_stack, context))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Creates a new thread in the running process.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Memory manager to use.
+    /// - `pid`: Process identifier.
+    /// - `thread_create_args`: Arguments for the thread creation.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, the thread identifier of the new thread is returned.
+    /// Otherwise, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if lifecycle capacity or a thread identifier cannot be
+    /// reserved, or if the thread execution context cannot be prepared.
+    ///
+    /// # Panics
+    ///
+    /// This function panics in debug builds if `thread_create_args.user_fn` is not a user address
+    /// or `pid` does not identify the running process. It also panics if lifecycle delivery was
+    /// disposed or a committed thread already owns a termination credit.
+    ///
+    pub fn create_thread(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        pid: ProcessIdentifier,
+        thread_create_args: &ThreadCreateArgs,
+    ) -> Result<ThreadIdentifier, Error> {
+        trace!("pid={pid:?}, thread_create_args={thread_create_args:?}");
+
+        // Assert pre-conditions (these should have been checked by the caller).
+        debug_assert!(Vmem::is_user_addr(thread_create_args.user_fn));
+        debug_assert!(
+            self.get_running().state().pid() == pid,
+            "create_thread: pid must match the running process"
+        );
+
+        let (reservation, (tid, next_tid, kernel_stack, context, inherited_blocked)): (
+            ThreadLifecycleReservation,
+            (ThreadIdentifier, ThreadIdentifier, KernelStack, ContextInformation, SigSet),
+        ) = self.prepare_thread_lifecycle_creation(|manager| {
+            // Reserve the next thread identifier early, before any resource allocation. Reap
+            // pending zombies on demand if the system-wide thread cap has been reached.
+            let (tid, next_tid): (ThreadIdentifier, ThreadIdentifier) =
+                manager.try_next_tid_reaping(mm)?;
+            let enable_interrupts: bool = manager.interrupt_capable;
+            let (kernel_stack, context): (KernelStack, ContextInformation) =
+                Self::forge_user_context(
+                    mm,
+                    manager.get_running_mut().state_mut().vmem_mut(),
+                    thread_create_args,
+                    enable_interrupts,
+                )?;
+            let inherited_blocked: SigSet = manager
+                .get_running_mut()
+                .running_mut()
+                .thread_state()
+                .blocked();
+            Ok((tid, next_tid, kernel_stack, context, inherited_blocked))
+        })?;
+
+        Ok(no_fail!(ThreadIdentifier, {
+            // Create a new thread.
+            let mut ready_thread: ReadyThread = self.tm.create_thread(
+                tid,
+                Some(kernel_stack),
+                None,
+                thread_create_args.user_tda,
+                context,
+            );
+            let termination_credit: ThreadLifecycleTerminationCredit =
+                self.delivery.commit_thread_creation(reservation);
+            ready_thread
+                .thread_state_mut()
+                .install_termination_credit(termination_credit);
+            ready_thread
+                .thread_state_mut()
+                .set_blocked(inherited_blocked);
+
+            // Commit the next thread identifier now that all fallible operations have succeeded.
+            self.tm.commit_next_tid(next_tid);
+
+            // Add the new thread to the running process.
+            let tid: ThreadIdentifier = ready_thread.id();
+            self.get_running_mut().add_thread(ready_thread);
+
+            Ok(tid)
+        }))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Sets the base address for the user-space thread data area of a thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: The identifier of the process containing the thread.
+    /// - `tid`: The identifier of the thread whose thread data area pointer is to be set.
+    /// - `user_tda`: Optional thread data area pointer to set.
+    ///
+    /// # Return Values
+    ///
+    /// Upon successful completion, this function return empty. Upon failure, this function returns
+    /// an error.
+    ///
+    /// # Errors
+    ///
+    /// This function fails with the following error codes:
+    ///
+    /// - [`ErrorCode::NoSuchEntry`]: The specified process or thread does not exist.
+    ///
+    pub fn set_thread_data_area(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+        user_tda: Option<VirtualAddress>,
+    ) -> Result<(), Error> {
+        // Search for the process across all states.
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+
+        // Search for the thread and set its data area.
+        match process.find_thread_mut(tid) {
+            Some(ThreadRefMut::Sleeping(thread)) => {
+                thread.set_thread_data_area(user_tda);
+                Ok(())
+            },
+            Some(ThreadRefMut::Running(thread)) => {
+                thread.set_thread_data_area(user_tda);
+                Ok(())
+            },
+            _ => {
+                let reason: &str = "thread not found";
+                error!("{reason} (tid={tid:?}, pid={pid:?}, user_tda={user_tda:?})");
+                Err(Error::new(ErrorCode::NoSuchEntry, reason))
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Gets the based address for the user-space thread data area of a thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: The identifier of the process containing the thread.
+    /// - `tid`: The identifier of the thread whose thread data area pointer is to be retrieved.
+    ///
+    /// # Return Values
+    ///
+    /// Upon successful completion, this function returns the based-address for the user-space
+    /// thread data area of the specified thread. Upon failure, this function returns an error.
+    ///
+    /// # Errors
+    ///
+    /// This function fails with the following error codes:
+    ///
+    /// - [`ErrorCode::NoSuchEntry`]: The specified process or thread does not exist.
+    ///
+    pub fn get_thread_data_area(
+        &self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+    ) -> Result<Option<VirtualAddress>, Error> {
+        // Search for the process across all states.
+        let process: ProcessRef = self.find_process(pid)?;
+
+        // Search for the thread and get its data area.
+        match process.find_thread(tid) {
+            Some(ThreadRef::Sleeping(thread)) => Ok(thread.get_thread_data_area()),
+            Some(ThreadRef::Running(thread)) => Ok(thread.get_thread_data_area()),
+            _ => {
+                let reason: &str = "thread not found";
+                error!("{reason} (tid={tid:?}, pid={pid:?})");
+                Err(Error::new(ErrorCode::NoSuchEntry, reason))
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Gets and/or sets the disposition of a signal for a target process.
+    ///
+    /// The previous disposition is always captured (for the `oldact` return) before the new
+    /// disposition, if any, is installed.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process whose disposition is to be changed.
+    /// - `signum`: The signal number (1-based).
+    /// - `new`: The disposition to install, or [`None`] to leave the disposition unchanged.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the previous disposition rendered as a [`SigAction`] is returned. Upon
+    /// failure, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::NoSuchProcess`]: The specified process does not exist.
+    /// - [`ErrorCode::InvalidArgument`]: The signal number is out of range.
+    ///
+    pub fn sigaction(
+        &mut self,
+        pid: ProcessIdentifier,
+        signum: usize,
+        new: Option<SignalDisposition>,
+    ) -> Result<SigAction, Error> {
+        // Search for the process across all states.
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let signals: &mut SignalControl = process.state_mut().signals_mut();
+
+        // Capture the previous disposition for the `oldact` return before installing the new one.
+        let old: SigAction = match signals.disposition(signum) {
+            Some(disposition) => disposition.to_sigaction(),
+            None => {
+                let reason: &str = "invalid signal number";
+                error!("{reason} (pid={pid:?}, signum={signum})");
+                return Err(Error::new(ErrorCode::InvalidArgument, reason));
+            },
+        };
+
+        // Install the new disposition, if one was requested.
+        if let Some(disposition) = new {
+            if signals.set_disposition(signum, disposition).is_none() {
+                // Unreachable: `disposition()` above already validated `signum`.
+                let reason: &str = "invalid signal number";
+                error!("{reason} (pid={pid:?}, signum={signum})");
+                return Err(Error::new(ErrorCode::InvalidArgument, reason));
+            }
+        }
+
+        Ok(old)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Gets and/or modifies the blocked-signal mask of the calling thread.
+    ///
+    /// The previous mask is always captured (for the `oldset` return) before the new mask, if any,
+    /// is installed. Signals that can never be blocked (`SIGKILL`/`SIGSTOP`) are silently cleared
+    /// from the resulting mask.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Identifier of the calling thread.
+    /// - `how`: One of `SIG_BLOCK`, `SIG_UNBLOCK`, or `SIG_SETMASK` (only consulted when `set` is
+    ///   provided).
+    /// - `set`: The signals to apply per `how`, or [`None`] to leave the mask unchanged.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the previous blocked-signal mask is returned. Upon failure, an error is
+    /// returned instead.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::NoSuchEntry`]: The specified thread does not exist.
+    /// - [`ErrorCode::InvalidArgument`]: `how` is not a recognized value.
+    ///
+    pub fn sigprocmask(
+        &mut self,
+        tid: ThreadIdentifier,
+        how: i32,
+        set: Option<SigSet>,
+    ) -> Result<SigSet, Error> {
+        // Search for the calling thread across all states.
+        let mut thread: ThreadRefMut = self.find_thread_mut(tid)?;
+        let state = thread.thread_state_mut();
+
+        // Capture the previous mask for the `oldset` return before applying any change.
+        let old: SigSet = state.blocked();
+
+        // Apply the requested change to the per-thread blocked mask, if one was requested.
+        if let Some(set) = set {
+            match compute_blocked(how, old, set) {
+                Some(next) => state.set_blocked(next),
+                None => {
+                    let reason: &str = "invalid sigprocmask how";
+                    error!("{reason} (tid={tid:?}, how={how})");
+                    return Err(Error::new(ErrorCode::InvalidArgument, reason));
+                },
+            }
+        }
+
+        Ok(old)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the set of signals that are pending on the calling process but blocked from delivery
+    /// to the calling thread (`pending & blocked`), as reported by `sigpending()`.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the calling process.
+    /// - `tid`: Identifier of the calling thread.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the pending-but-blocked signal set. Upon failure, an error is returned.
+    ///
+    pub fn sigpending(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+    ) -> Result<SigSet, Error> {
+        let blocked: SigSet = self.find_thread_mut(tid)?.thread_state_mut().blocked();
+        let pending: SigSet = self
+            .find_process_mut(pid)?
+            .state_mut()
+            .signals_mut()
+            .pending();
+        Ok(pending & blocked)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Atomically installs the temporary blocked-signal mask for a `sigsuspend()` and records the
+    /// mask to reinstate once the call completes.
+    ///
+    /// The previous mask is saved so that `sigreturn()` restores it after the interrupting handler
+    /// runs, matching the POSIX requirement that `sigsuspend()` leave the mask unchanged on return.
+    /// Signals that can never be blocked (`SIGKILL`/`SIGSTOP`) are cleared from the installed mask.
+    /// The return value reports whether an already-pending caught signal is now deliverable under
+    /// the temporary mask; in that case `sigsuspend()` must return `EINTR` immediately so the
+    /// normal return-to-user checkpoint can deliver it without sleeping forever.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Identifier of the calling thread.
+    /// - `mask`: The temporary mask to install for the duration of the suspension.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, `true` is returned when a caught pending signal is deliverable under the
+    /// temporary mask. Upon failure, an error is returned instead.
+    ///
+    pub fn install_sigsuspend_mask(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+        mask: SigSet,
+    ) -> Result<bool, Error> {
+        self.find_process(pid)?;
+
+        let installed: SigSet = mask & !UNBLOCKABLE;
+        let mut thread: ThreadRefMut = self.find_thread_mut(tid)?;
+        let state = thread.thread_state_mut();
+        let previous: SigSet = state.blocked();
+        state.set_saved_blocked(Some(previous));
+        state.set_blocked(installed);
+
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let signals: &mut SignalControl = process.state_mut().signals_mut();
+        let mut deliverable: SigSet = signals.pending() & !installed;
+        while deliverable != 0 {
+            let signum: usize = (deliverable.trailing_zeros() as usize) + 1;
+            if let Some(SignalDisposition::Handler(_)) = signals.disposition(signum) {
+                return Ok(true);
+            }
+            deliverable &= deliverable - 1;
+        }
+
+        Ok(false)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Restores a rendezvous caller's blocked-signal mask after its pending push or pull is
+    /// registered, and reports whether a caught pending signal became deliverable.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the calling process.
+    /// - `tid`: Identifier of the calling thread.
+    /// - `mask`: Blocked-signal mask to restore.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, `true` is returned when a caught pending signal is deliverable under the
+    /// restored mask. Otherwise, `false` is returned.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the process or thread does not exist.
+    ///
+    pub fn restore_rendezvous_signal_mask(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+        mask: SigSet,
+    ) -> Result<bool, Error> {
+        self.find_process(pid)?;
+
+        let installed: SigSet = mask & !UNBLOCKABLE;
+        let thread_pending: SigSet = {
+            let mut thread: ThreadRefMut = self.find_thread_mut(tid)?;
+            let state = thread.thread_state_mut();
+            state.set_blocked(installed);
+            state.pending()
+        };
+
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let signals: &mut SignalControl = process.state_mut().signals_mut();
+        let mut deliverable: SigSet = (signals.pending() | thread_pending) & !installed;
+        while deliverable != 0 {
+            let signum: usize = (deliverable.trailing_zeros() as usize) + 1;
+            if let Some(SignalDisposition::Handler(_)) = signals.disposition(signum) {
+                return Ok(true);
+            }
+            deliverable &= deliverable - 1;
+        }
+
+        Ok(false)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Reinstates the blocked-signal mask that [`Self::install_sigsuspend_mask`] saved, undoing a
+    /// `sigsuspend()` that is unwinding without delivering a handler.
+    ///
+    /// On the normal path, `sigsuspend()` leaves mask restoration to `sigreturn()` once the
+    /// interrupting handler returns. When the call instead fails before any handler runs,
+    /// `sigreturn()` never executes, so this restores the saved mask directly to honor the POSIX
+    /// requirement that `sigsuspend()` leave the mask unchanged on return (even on failure). It is a
+    /// no-op when no mask was saved.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Identifier of the calling thread.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, empty is returned. Upon failure, an error is returned instead.
+    ///
+    pub fn restore_sigsuspend_mask(&mut self, tid: ThreadIdentifier) -> Result<(), Error> {
+        let mut thread: ThreadRefMut = self.find_thread_mut(tid)?;
+        let state = thread.thread_state_mut();
+        if let Some(saved) = state.take_saved_blocked() {
+            state.set_blocked(saved & !UNBLOCKABLE);
+        }
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Posts a signal to a target process and evaluates its delivery.
+    ///
+    /// A process may always signal itself; posting to another process requires the
+    /// [`Capability::ProcessManagement`] capability, so an unprivileged process cannot post
+    /// arbitrary signals to others by calling the kernel directly (cross-process policy is the
+    /// province of the process-manager daemon). A `signum` of zero performs only the
+    /// permission/existence check (the POSIX null-signal probe).
+    ///
+    /// Signals whose effective action terminates the process reuse the existing termination paths:
+    /// the cross-process `terminate()` path for a non-running target, or the caller's own `exit()`
+    /// for a self-directed fatal signal (reported back as [`KillOutcome::TerminateSelf`] because
+    /// `exit()` performs a context switch and must run outside the process manager). `SIGKILL` is
+    /// unconditional and bypasses disposition and mask checks. A caught (handler) signal is posted
+    /// and a candidate thread is woken so that delivery is evaluated at its return-to-user
+    /// checkpoint.
+    ///
+    /// # Parameters
+    ///
+    /// - `caller`: Identifier of the calling process.
+    /// - `target`: Identifier of the process to signal.
+    /// - `signum`: Signal number to post, or zero for the null-signal probe.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, a [`KillOutcome`] describing the remaining work for the kernel-call handler.
+    /// Upon failure, an error is returned instead.
+    ///
+    pub fn kill(
+        &mut self,
+        caller: ProcessIdentifier,
+        target: ProcessIdentifier,
+        signum: usize,
+    ) -> Result<KillOutcome, Error> {
+        trace!("caller={caller:?}, target={target:?}, signum={signum}");
+
+        // A process may always signal itself; cross-process posting is privileged.
+        if target != caller && !self.has_capability(caller, Capability::ProcessManagement)? {
+            let reason: &str = "process does not have process management capability";
+            error!("{reason} (caller={caller:?}, target={target:?})");
+            return Err(Error::new(ErrorCode::PermissionDenied, reason));
+        }
+
+        // The target must exist. This also services the null-signal probe below.
+        self.find_process(target)?;
+
+        // A null signal performs only the permission/existence check.
+        if signum == 0 {
+            return Ok(KillOutcome::Done);
+        }
+
+        // Reject out-of-range signal numbers.
+        if signum > SIG_MAX {
+            let reason: &str = "invalid signal number";
+            error!("{reason} (signum={signum})");
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+
+        // SIGKILL is uncatchable and unconditional: terminate immediately, bypassing disposition
+        // and mask checks.
+        if signum == SIGKILL {
+            return self.kill_terminate(caller, target);
+        }
+
+        // Resolve the effect of the signal from the target's disposition, posting it to the pending
+        // set when delivery must be deferred. The borrow of the process manager is dropped before
+        // any termination, interruption, or wakeup so those operations can re-borrow it.
+        let action: PostAction = {
+            let mut process: ProcessRefMut = self.find_process_mut(target)?;
+            let signals: &mut SignalControl = process.state_mut().signals_mut();
+            match signals.disposition(signum) {
+                Some(SignalDisposition::Ignore) => PostAction::None,
+                Some(SignalDisposition::Handler(_)) => {
+                    signals.post(signum);
+                    PostAction::Interrupt
+                },
+                Some(SignalDisposition::Default) => match default_action(signum) {
+                    DefaultAction::Terminate => PostAction::Terminate,
+                    DefaultAction::Core => {
+                        info!(
+                            "terminated by signal default core action (target={target:?}, \
+                             signum={signum})"
+                        );
+                        PostAction::Terminate
+                    },
+                    DefaultAction::Ignore => PostAction::None,
+                    // Job-control stop suspends the target. The effect is applied directly to the
+                    // target's scheduling state below, so the signal is consumed rather than left
+                    // pending.
+                    DefaultAction::Stop => PostAction::Stop,
+                    // The continue effect is applied unconditionally for SIGCONT above (it must
+                    // resume a stopped target regardless of disposition), so nothing remains here.
+                    DefaultAction::Continue => PostAction::None,
+                },
+                None => {
+                    let reason: &str = "invalid signal number";
+                    error!("{reason} (signum={signum})");
+                    return Err(Error::new(ErrorCode::InvalidArgument, reason));
+                },
+            }
+        };
+
+        // SIGCONT's continue effect is unconditional (POSIX): it resumes a stopped target
+        // regardless of the target's disposition, so it is applied here rather than only on the
+        // default path. An installed handler still runs — that delivery is driven by the
+        // disposition-derived action below.
+        if signum == SIGCONT {
+            self.continue_process(target)?;
+        }
+
+        match action {
+            PostAction::Terminate => return self.kill_terminate(caller, target),
+            PostAction::Interrupt => self.interrupt_signal_candidate(target, signum),
+            PostAction::Stop => self.stop_process(target)?,
+            PostAction::None => {},
+        }
+        Ok(KillOutcome::Done)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Routes a fatal signal to the appropriate termination path: the cross-process `terminate()`
+    /// for a non-running target, or [`KillOutcome::TerminateSelf`] when the caller is signalling
+    /// itself (so the kernel-call handler can invoke `exit()` on the calling process).
+    ///
+    /// # Parameters
+    ///
+    /// - `caller`: Identifier of the calling process.
+    /// - `target`: Identifier of the process to terminate.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the [`KillOutcome`] for the handler. Upon failure, an error is returned.
+    ///
+    fn kill_terminate(
+        &mut self,
+        caller: ProcessIdentifier,
+        target: ProcessIdentifier,
+    ) -> Result<KillOutcome, Error> {
+        if target == caller {
+            Ok(KillOutcome::TerminateSelf)
+        } else {
+            self.terminate(target)?;
+            Ok(KillOutcome::Done)
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Stops (suspends) a process in response to a job-control stop signal whose default action is
+    /// *stop* (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`).
+    ///
+    /// The process is marked stopped, which makes the scheduler skip it — none of its threads run —
+    /// regardless of whether they are currently ready, running, suspended, or interrupted. The
+    /// threads keep their underlying state, so a later `SIGCONT` resumes them from where they were.
+    /// Any pending `SIGCONT` is discarded, mirroring the POSIX rule that a stop supersedes a
+    /// not-yet-acted-upon continue.
+    ///
+    /// The target is never the running process here: cross-process posting is relayed through the
+    /// process-manager daemon (which is the running process during the kernel call). A process that
+    /// stops *itself* marks its own running state and is descheduled and skipped at the next
+    /// scheduling opportunity (its next blocking call or preemption).
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process to stop.
+    ///
+    fn stop_process(&mut self, pid: ProcessIdentifier) -> Result<(), Error> {
+        // The kernel/idle process underpins the scheduler's always-runnable invariant (a stopped
+        // process is skipped by `take_earliest_ready`, which relies on the kernel process always
+        // being selectable), so it must never be stopped.
+        if pid == ProcessIdentifier::KERNEL {
+            let reason: &str = "cannot stop the kernel process";
+            error!("{reason}");
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        // A stop discards a pending continue and vice versa.
+        process.state_mut().signals_mut().clear_pending(SIGCONT);
+        process.state_mut().set_stopped(true);
+        trace!("stopped process (pid={pid:?})");
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Continues a process in response to `SIGCONT`, clearing its stopped flag so the scheduler
+    /// considers it runnable again. A process that was suspended in a blocking kernel call when it
+    /// was stopped stays suspended and resumes that call when it next wakes; a process that was
+    /// ready or running resumes execution at the next scheduling opportunity. Continuing a process
+    /// that is not stopped is a no-op. Any pending stop signals are discarded, mirroring the POSIX
+    /// rule that a continue supersedes a not-yet-acted-upon stop.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process to continue.
+    ///
+    fn continue_process(&mut self, pid: ProcessIdentifier) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        for stop_signum in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+            process.state_mut().signals_mut().clear_pending(stop_signum);
+        }
+        process.state_mut().set_stopped(false);
+        trace!("continued process (pid={pid:?})");
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Interrupts a blocked candidate thread of a process to which a caught signal was posted, so
+    /// that the thread's blocking kernel call reports the interruption (returning `EINTR`, or
+    /// transparently restarting when the handler requests `SA_RESTART`) and the handler is delivered
+    /// at its return-to-user checkpoint.
+    ///
+    /// Only a fully-suspended process needs explicit help; a process that still has a ready or
+    /// running thread reaches its own checkpoint without being woken, because every return to user
+    /// mode is a checkpoint — including the return from the timer interrupt through which a
+    /// preempted thread resumes, so even a thread that makes no kernel calls observes the signal
+    /// once it is rescheduled. A signal that the candidate thread would block is left pending and
+    /// interrupts nothing.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process whose candidate thread should be interrupted.
+    /// - `signum`: Signal number that was posted.
+    ///
+    fn interrupt_signal_candidate(&mut self, pid: ProcessIdentifier, signum: usize) {
+        let candidate: Option<ThreadIdentifier> = self
+            .suspended
+            .iter()
+            .find(|process| process.state().pid() == pid)
+            .and_then(|process| process.candidate_tid_for(signum));
+        if let Some(tid) = candidate {
+            self.interrupt_suspended_thread(tid);
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Moves the suspended process that owns thread `tid` to the interrupted list, recording the
+    /// interruption as [`InterruptReason::Signaled`] on that thread so it is resumed at the next
+    /// scheduling opportunity and its blocking call observes the interruption.
+    ///
+    /// Best-effort: if the thread is no longer suspended (for example, it was already woken by
+    /// another notifier), the process lists are left unchanged.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Identifier of the thread to interrupt.
+    ///
+    fn interrupt_suspended_thread(&mut self, tid: ThreadIdentifier) {
+        let mut scanned: LinkedList<SleepingProcess> = LinkedList::new();
+        while let Some(process) = self.suspended.pop_front() {
+            if process.find_thread(tid).is_some() {
+                match process.interrupt_thread(tid, InterruptReason::Signaled) {
+                    Ok(interrupted_process) => self.interrupted.push_back(interrupted_process),
+                    Err(suspended_process) => self.suspended.push_front(suspended_process),
+                }
+                // Restore the processes scanned before the match, preserving their order.
+                while let Some(process) = scanned.pop_back() {
+                    self.suspended.push_front(process);
+                }
+                return;
+            }
+            scanned.push_back(process);
+        }
+        // Thread not found among suspended processes; rollback the list to its original state.
+        self.suspended = scanned;
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Writes a string directly to user space without heap allocation, followed by a single `\0`
+    /// terminator.
+    ///
+    /// The destination receives the NUL-separated wire format. When `space_is_delimiter` is false,
+    /// the source string is already in that format (it may itself contain interior NUL bytes, which
+    /// are copied verbatim). When `space_is_delimiter` is true, the source is the space-separated
+    /// boot command line: it is copied verbatim and then every ASCII space byte is overwritten in
+    /// place with a NUL so the new image observes NUL-delimited tokens. This conversion is done by
+    /// patching individual bytes in user memory, so it needs no kernel-heap allocation (which a
+    /// max-length command line could not satisfy).
+    ///
+    /// The single terminator written here, together with the zero-filled remainder of the
+    /// destination page, forms the empty-token end-of-list sentinel that the new image's runtime
+    /// stops at.
+    ///
+    /// # Parameters
+    ///
+    /// - `vmem`: Virtual memory address space to write into.
+    /// - `dest`: Destination virtual address in user space.
+    /// - `s`: Source string to write.
+    /// - `space_is_delimiter`: When true, ASCII spaces in `s` are token delimiters and are
+    ///   substituted with NUL in the destination; when false, `s` is copied verbatim.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error is returned instead.
+    ///
+    fn write_nul_terminated_to_user(
+        vmem: &mut Vmem,
+        dest: VirtualAddress,
+        s: &str,
+        space_is_delimiter: bool,
+    ) -> Result<(), Error> {
+        static NUL: u8 = 0;
+        if !s.is_empty() {
+            vmem.copy_to_user_unaligned(dest, VirtualAddress::new(s.as_ptr() as usize), s.len())?;
+            // Substitute ASCII spaces with NUL in place so the boot (space-separated) command line
+            // is delivered in the NUL-separated wire format without allocating a converted copy.
+            if space_is_delimiter {
+                for (i, _) in s.as_bytes().iter().enumerate().filter(|(_, &b)| b == b' ') {
+                    let space_vaddr: VirtualAddress =
+                        VirtualAddress::new(dest.into_raw_value() + i);
+                    vmem.copy_to_user_unaligned(
+                        space_vaddr,
+                        VirtualAddress::new(&NUL as *const u8 as usize),
+                        1,
+                    )?;
+                }
+            }
+        }
+        let nul_vaddr: VirtualAddress = VirtualAddress::new(dest.into_raw_value() + s.len());
+        vmem.copy_to_user_unaligned(nul_vaddr, VirtualAddress::new(&NUL as *const u8 as usize), 1)?;
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Creates a new process.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Memory manager to use.
+    /// - `elf`: ELF header of the executable file.
+    /// - `args`: Command line arguments.
+    /// - `env`: Environment variables.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, the process identifier of the new process is returned.
+    /// Otherwise, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if process or thread capacity is exhausted, lifecycle
+    /// capacity cannot be reserved, or the process image cannot be prepared.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if lifecycle delivery was disposed, a lifecycle sequence is exhausted,
+    /// the preallocated lifecycle queue is full, or a committed process or thread already owns its
+    /// termination credit.
+    ///
+    pub fn create_process(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        elf: &Elf32Fhdr,
+        args: &str,
+        env: &str,
+    ) -> Result<ProcessIdentifier, Error> {
+        trace!("args={:?}, env={:?}", args, env);
+
+        // Refuse to create a new process when the system-wide live-process cap has been reached.
+        if self.live_count >= ::config::kernel::MAX_PROCESSES {
+            let reason: &str = "maximum number of processes reached";
+            error!(
+                "{reason} (live_count={}, max_processes={})",
+                self.live_count,
+                ::config::kernel::MAX_PROCESSES
+            );
+            return Err(Error::new(ErrorCode::OutOfMemory, reason));
+        }
+        // Recognize a kernel-spawned system daemon by its program name (the first token of the
+        // command-line arguments) so it is classified as a daemon regardless of the process
+        // identifier it receives. This keeps daemon identification correct for deployments that
+        // omit a daemon and let the init workload take that daemon's conventional identifier. A
+        // name that is already registered is discarded, so this is set only when the commit below
+        // will actually grow the registry.
+        let program_name: &str = args.split_whitespace().next().unwrap_or("");
+        let daemon_name: Option<&'static str> = ::config::daemons::GUEST_DAEMON_NAMES
+            .iter()
+            .copied()
+            .find(|&name| name == program_name)
+            .filter(|name| {
+                !self
+                    .daemon_pids
+                    .iter()
+                    .any(|(registered, _)| registered == name)
+            });
+
+        let (reservation, thread_reservation, (pid, next_pid, next_tid, parent_pid, mut prepared)): (
+            LifecycleCreationReservation,
+            ThreadLifecycleReservation,
+            (
+                ProcessIdentifier,
+                ProcessIdentifier,
+                ThreadIdentifier,
+                ProcessIdentifier,
+                PreparedProcess,
+            ),
+        ) = self.prepare_lifecycle_creation(|manager| {
+            // Reserve the next process and thread identifiers early, before resource allocation.
+            let (pid, next_pid): (ProcessIdentifier, ProcessIdentifier) = manager.try_next_pid()?;
+            let (tid, next_tid): (ThreadIdentifier, ThreadIdentifier) =
+                manager.tm.try_next_tid()?;
+            manager.check_lifecycle_creation_injection()?;
+
+            if daemon_name.is_some() && manager.daemon_pids.try_reserve(1).is_err() {
+                let reason: &str = "failed to reserve process daemon registry capacity";
+                error!("{reason}");
+                return Err(Error::new(ErrorCode::OutOfMemory, reason));
+            }
+
+            // The boot command line is space-separated, but the user-space runtime parses the
+            // NUL-separated wire format produced by `execv()`. Stream the conversion into the new
+            // image's user page without allocating an intermediate buffer.
+            let (vmem, thread): (Vmem, ReadyThread) = Self::build_user_image(
+                mm,
+                &manager.tm,
+                manager.get_running().state().vmem(),
+                tid,
+                |mm, vmem| mm.load_elf(vmem, elf),
+                args,
+                env,
+                true,
+                manager.interrupt_capable,
+            )?;
+
+            let parent_pid: ProcessIdentifier = manager.get_running().state().pid();
+            let process: RunnableProcess =
+                RunnableProcess::new_uncommitted(pid, parent_pid, thread, vmem);
+
+            Ok((pid, next_pid, next_tid, parent_pid, PreparedProcess::new(process)))
+        })?;
+
+        Ok(no_fail!(ProcessIdentifier, {
+            // Commit the next process and thread identifiers now that all allocations and fallible
+            // operations have succeeded.
+            self.next_pid = next_pid;
+            self.tm.commit_next_tid(next_tid);
+            self.live_count += 1;
+
+            // Remember daemon identifiers so a process's role can be classified authoritatively
+            // later (e.g. at termination), when only its identifier is available. `daemon_name` is
+            // only set for an unregistered daemon whose registry slot was reserved above, so this
+            // push cannot allocate.
+            if let Some(daemon_name) = daemon_name {
+                self.daemon_pids.push((daemon_name, pid));
+            }
+
+            // Commit the creation to the ordered delivery broker. Waking the lifecycle owner is
+            // deferred because the process manager is mutably borrowed here.
+            let role: ProcessRole = self.classify_role(pid, parent_pid);
+            let termination_credit = self
+                .delivery
+                .commit_creation(reservation, ProcessCreationInfo::new(pid, parent_pid, role));
+            let thread_termination_credit: ThreadLifecycleTerminationCredit =
+                self.delivery.commit_thread_creation(thread_reservation);
+            prepared.install_termination_credit(termination_credit);
+            prepared.install_thread_termination_credit(thread_termination_credit);
+            prepared.enqueue(&mut self.ready);
+
+            Ok(pid)
+        }))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Builds a fresh user address space and a ready main thread for a program image. This is the
+    /// shared core used by both [`Self::create_process`] (spawning a brand-new process) and
+    /// [`Self::do_execv`] (replacing the image of an existing process).
+    ///
+    /// The routine creates a new address space cloned from `template_vmem` (so that the kernel
+    /// mappings are inherited), loads the ELF image via the `load_elf` callback, installs the
+    /// argument and environment pages, reserves the initial user stack, and forges the
+    /// kernel/user execution context. All work is fallible and side-effect free with respect to
+    /// the process manager: on failure the freshly allocated address space is dropped and an error
+    /// is returned.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Memory manager to use.
+    /// - `tm`: Thread manager used to construct the main thread.
+    /// - `template_vmem`: Address space whose kernel mappings are cloned into the new one.
+    /// - `tid`: Thread identifier reserved for the new main thread.
+    /// - `load_elf`: Callback that loads the program image into the new address space, returning
+    ///   the entry point and the address past the last loaded segment. This indirection lets the
+    ///   caller choose the image source: a contiguous kernel blob (boot) or another process's
+    ///   address space (execv).
+    /// - `args`: Command line arguments. When `space_is_delimiter` is true they are in the boot
+    ///   space-separated format; otherwise they are in the NUL-separated wire format (each token
+    ///   delimited by a NUL byte; no trailing delimiter required) where NUL is the only delimiter,
+    ///   so a token may carry any other byte, including a space.
+    /// - `env`: Environment variables (same format rules as `args`).
+    /// - `space_is_delimiter`: When true, ASCII spaces in `args`/`env` are token delimiters and are
+    ///   converted to NUL in the new image's pages; when false, the inputs are already
+    ///   NUL-separated and are installed verbatim.
+    /// - `enable_interrupts`: Whether the forged context should run with interrupts enabled.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the new address space and the ready main thread are returned. Otherwise, an
+    /// error is returned instead.
+    ///
+    #[allow(clippy::too_many_arguments)]
+    fn build_user_image<F>(
+        mm: &mut VirtMemoryManager,
+        tm: &ThreadManager,
+        template_vmem: &Vmem,
+        tid: ThreadIdentifier,
+        load_elf: F,
+        args: &str,
+        env: &str,
+        space_is_delimiter: bool,
+        enable_interrupts: bool,
+    ) -> Result<(Vmem, ReadyThread), Error>
+    where
+        F: FnOnce(
+            &mut VirtMemoryManager,
+            &mut Vmem,
+        ) -> Result<(VirtualAddress, PageAligned<VirtualAddress>), Error>,
+    {
+        // The new image's pages hold the NUL-separated wire format: NUL is the token delimiter, so
+        // a token may carry any other byte (including a space) and surrounding spaces must be
+        // preserved verbatim. The exec path supplies this format directly; the boot path supplies a
+        // space-separated command line and sets `space_is_delimiter` so the spaces are converted to
+        // NUL while streaming into user space (see `write_nul_terminated_to_user`). The new image
+        // re-splits on NUL and stops at the first empty token, which the zero-filled tail of the
+        // page below provides.
+        //
+        // args_total_len includes the single NUL terminator that will be written to user space
+        // after the last token; combined with the zero-filled remainder of the page, it forms the
+        // empty-token end-of-list sentinel.
+        let args_total_len: usize = args.len() + 1;
+
+        // env_len includes the null terminator that will be written to user space.
+        let env_total_len: usize = env.len() + 1;
+
+        // Create a new memory address space for the image, inheriting kernel mappings.
+        let mut vmem: Vmem = mm.new_vmem(template_vmem)?;
+
+        // Run the remaining fallible build steps. On failure, reclaim any user frames already
+        // mapped into `vmem` before returning: dropping the address space alone frees only its
+        // page-table structures, not the user frames their entries map, so a partially built
+        // image would otherwise leak every frame mapped so far.
+        // The closure is a stand-in for a `try` block (collect `?` early-returns so the error path
+        // can run cleanup); it is invoked exactly once.
+        #[allow(clippy::redundant_closure_call)]
+        let build_result: Result<ReadyThread, Error> = (|| -> Result<ReadyThread, Error> {
+            // Load the ELF image into the new address space via the caller-supplied loader.
+            let (entry, args_vaddr): (VirtualAddress, PageAligned<VirtualAddress>) =
+                load_elf(mm, &mut vmem)?;
+
+            // Allocate a user-space page, write command line arguments to it, and check for errors.
+            // The total length includes the null terminator written after the args bytes, and must fit
+            // entirely within a single page.
+            if args_total_len > PAGE_SIZE {
+                let reason: &str = "command line is too long";
+                error!("{reason} (cmdline.len={:?})", args_total_len);
+                return Err(Error::new(ErrorCode::InvalidArgument, reason));
+            }
+            mm.alloc_upages(
+                &mut vmem,
+                args_vaddr,
+                AccessPermission::RDWR,
+                true,
+                1,
+                &mut crate::mm::try_vec_with_capacity(1)?,
+            )?;
+            // Write args as a NUL-terminated string directly to user space.
+            Self::write_nul_terminated_to_user(
+                &mut vmem,
+                args_vaddr.into_inner(),
+                args,
+                space_is_delimiter,
+            )?;
+            debug!(
+                "arguments written to user space (args_vaddr={:?}, args={:?})",
+                args_vaddr,
+                args.as_bytes()
+            );
+
+            // Allocate another page for the environment variables and check for errors.
+            // The total length includes the null terminator and must fit within a single page.
+            if env_total_len > PAGE_SIZE {
+                let reason: &str = "environment variables are too long";
+                error!("{reason} (env.len={:?})", env_total_len);
+                return Err(Error::new(ErrorCode::InvalidArgument, reason));
+            }
+            let envp_vaddr: PageAligned<VirtualAddress> =
+                PageAligned::<VirtualAddress>::from_address(VirtualAddress::new(
+                    args_vaddr.into_raw_value() + PAGE_SIZE,
+                ))?;
+            mm.alloc_upages(
+                &mut vmem,
+                envp_vaddr,
+                AccessPermission::RDWR,
+                true,
+                1,
+                &mut crate::mm::try_vec_with_capacity(1)?,
+            )?;
+
+            // Write env as a NUL-terminated string directly to user space.
+            Self::write_nul_terminated_to_user(
+                &mut vmem,
+                envp_vaddr.into_inner(),
+                env,
+                space_is_delimiter,
+            )?;
+            debug!(
+                "environment variables written to user space (envp_vaddr={:?}, env={:?})",
+                envp_vaddr,
+                env.as_bytes()
+            );
+
+            // Create a kernel context.
+            let user_stack: UserStack =
+                UserStack::new(PageAligned::from_raw_value(USER_STACK_TOP_RAW)?);
+            let user_fn: VirtualAddress = entry;
+            let argp: usize = args_vaddr.into_raw_value();
+            let envp: usize = envp_vaddr.into_raw_value();
+
+            let thread_args: ThreadCreateArgs = ThreadCreateArgs {
+                user_fn,
+                user_fn_arg0: argp,
+                user_fn_arg1: envp,
+                user_stack_base: user_stack.base().into_inner(),
+                user_stack_size: user_stack.size(),
+                user_tda: None, // The base address for the user-space thread data area the main thread is set by the user-space runtime.
+            };
+
+            let (kernel_stack, context): (KernelStack, ContextInformation) =
+                Self::forge_user_context(mm, &mut vmem, &thread_args, enable_interrupts)?;
+
+            // Map only the minimum number of stack pages near the stack top (where ESP starts).
+            // Additional pages up to USER_STACK_SIZE are demand-paged on stack growth faults.
+            // NOTE: on failure beyond this point the error path must reclaim user pages from `vmem`, otherwise
+            // user frames would leak.
+            let initial_stack_base: PageAligned<VirtualAddress> = PageAligned::from_raw_value(
+                user_stack.top().into_raw_value() - USER_STACK_MIN_SIZE,
+            )?;
+            let count = USER_STACK_MIN_SIZE / PAGE_SIZE;
+            mm.alloc_upages(
+                &mut vmem,
+                initial_stack_base,
+                AccessPermission::RDWR,
+                true,
+                count,
+                &mut crate::mm::try_vec_with_capacity(count)?,
+            )?;
+
+            // Construct the ready main thread. This is infallible.
+            let thread: ReadyThread = tm.create_thread(
+                tid,
+                Some(kernel_stack),
+                Some(user_stack),
+                thread_args.user_tda,
+                context,
+            );
+
+            Ok(thread)
+        })();
+
+        match build_result {
+            Ok(thread) => Ok((vmem, thread)),
+            Err(error) => {
+                // Reclaim any user frames already mapped into the partially built image before it
+                // is dropped, so a failed build does not leak frames.
+                if let Err(cleanup_error) = vmem.clear_user_space() {
+                    warn!(
+                        "build_user_image(): cleanup after build failure also failed \
+                         (error={cleanup_error:?})"
+                    );
+                }
+                Err(error)
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Duplicates the calling process. The child process is created with a clone of the
+    /// caller's address space, and its main thread starts executing the user-supplied entry
+    /// function on the user-supplied stack.
+    ///
+    /// The operation is refused when the calling process owns any "special" resources, as
+    /// reported by [`ProcessState::has_special_resources`]. This guarantees that no resource
+    /// that is uniquely owned by the parent (memory-mapped I/O regions, port-mapped I/O
+    /// ports, event ownerships, or buffered in-flight messages) is silently leaked or
+    /// duplicated into the child.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Memory manager to use.
+    /// - `pid`: Process identifier of the calling (parent) process.
+    /// - `args`: Thread creation arguments describing the child main thread's entry point
+    ///   and stack.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, the process identifier of the new (child) process is
+    /// returned. Otherwise, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function fails with the following error codes, among others:
+    ///
+    /// - [`ErrorCode::OperationNotPermitted`]: The calling process owns one or more special
+    ///   resources that prevent it from being duplicated.
+    /// - [`ErrorCode::InvalidArgument`]: The supplied entry function or stack does not lie
+    ///   within the user address space.
+    /// - [`ErrorCode::OutOfMemory`]: Process, thread, or lifecycle capacity is exhausted, or the
+    ///   child process cannot be prepared.
+    ///
+    /// # Panics
+    ///
+    /// This function panics in debug builds if `pid` does not identify the running process. It also
+    /// panics if lifecycle delivery was disposed, a lifecycle sequence is exhausted, the
+    /// preallocated lifecycle queue is full, or a committed process or thread already owns its
+    /// termination credit.
+    ///
+    pub fn duplicate_process(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        pid: ProcessIdentifier,
+        args: &ThreadCreateArgs,
+    ) -> Result<ProcessIdentifier, Error> {
+        trace!("pid={pid:?}, args={args:?}");
+
+        // Sanity-check the caller against the running process, mirroring create_thread().
+        debug_assert!(
+            self.get_running().state().pid() == pid,
+            "duplicate_process: pid must match the running process"
+        );
+
+        // Validate user-supplied entry point and stack range.
+        if !Vmem::is_user_addr(args.user_fn) {
+            let reason: &str = "user function does not lie within the user address space";
+            error!("{reason} (user_fn={:?})", args.user_fn);
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+        if !Vmem::is_user_region(args.user_stack_base, args.user_stack_size) {
+            let reason: &str = "user stack does not lie within the user address space";
+            error!(
+                "{reason} (user_stack_base={:?}, user_stack_size={})",
+                args.user_stack_base, args.user_stack_size
+            );
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+        if let Some(user_tda) = args.user_tda {
+            if !Vmem::is_user_addr(user_tda) {
+                let reason: &str =
+                    "user-space thread data area does not lie within the user address space";
+                error!("{reason} (user_tda={:?})", user_tda);
+                return Err(Error::new(ErrorCode::InvalidArgument, reason));
+            }
+        }
+
+        // Refuse to duplicate when the caller owns special resources.
+        if self.get_running().state().has_special_resources() {
+            let reason: &str = "caller owns special resources (mmio/pmio/events/mailbox)";
+            error!("{reason} (pid={pid:?})");
+            return Err(Error::new(ErrorCode::OperationNotPermitted, reason));
+        }
+
+        // Refuse to create a new process when the system-wide live-process cap has been reached.
+        if self.live_count >= ::config::kernel::MAX_PROCESSES {
+            let reason: &str = "maximum number of processes reached";
+            error!(
+                "{reason} (live_count={}, max_processes={})",
+                self.live_count,
+                ::config::kernel::MAX_PROCESSES
+            );
+            return Err(Error::new(ErrorCode::OutOfMemory, reason));
+        }
+        #[allow(clippy::type_complexity)]
+        let (reservation, thread_reservation, (child_pid, next_pid, next_tid, mut prepared)): (
+            LifecycleCreationReservation,
+            ThreadLifecycleReservation,
+            (ProcessIdentifier, ProcessIdentifier, ThreadIdentifier, PreparedProcess),
+        ) = self.prepare_lifecycle_creation(|manager| {
+            // Reserve identifiers early, before allocation. Reap pending zombies on demand if the
+            // thread cap is held by terminated-but-unharvested processes.
+            let (child_pid, next_pid): (ProcessIdentifier, ProcessIdentifier) =
+                manager.try_next_pid()?;
+            let (child_tid, next_tid): (ThreadIdentifier, ThreadIdentifier) =
+                manager.try_next_tid_reaping(mm)?;
+            manager.check_lifecycle_creation_injection()?;
+
+            // Clone the caller's address space.
+            let mut vmem: Vmem = mm.new_vmem(manager.get_running().state().vmem())?;
+
+            // Share the parent's user pages with the child and forge its initial context.
+            // Reclaim linked frames if either operation fails.
+            let forge_result: Result<(KernelStack, ContextInformation), Error> = match mm
+                .link_user_pages(manager.get_running_mut().state_mut().vmem_mut(), &mut vmem)
+            {
+                Ok(()) => Self::forge_user_context(mm, &mut vmem, args, manager.interrupt_capable),
+                Err(error) => Err(error),
+            };
+
+            let (kernel_stack, context): (KernelStack, ContextInformation) = match forge_result {
+                Ok(parts) => parts,
+                Err(error) => {
+                    if let Err(cleanup_error) = vmem.clear_user_space() {
+                        warn!(
+                            "duplicate_process(): cleanup after failure also failed \
+                             (error={cleanup_error:?})"
+                        );
+                    }
+                    return Err(error);
+                },
+            };
+
+            // Capture the signal state inherited by the child.
+            let inherited_signals: SignalControl =
+                manager.get_running().state().signals().inherited_for_fork();
+            let inherited_blocked: SigSet = manager
+                .get_running_mut()
+                .running_mut()
+                .thread_state()
+                .blocked();
+
+            let mut thread: ReadyThread = manager.tm.create_thread(
+                child_tid,
+                Some(kernel_stack),
+                None,
+                args.user_tda,
+                context,
+            );
+            thread.thread_state_mut().set_blocked(inherited_blocked);
+            let mut process: RunnableProcess =
+                RunnableProcess::new_uncommitted(child_pid, pid, thread, vmem);
+            process.set_signals(inherited_signals);
+
+            Ok((child_pid, next_pid, next_tid, PreparedProcess::new(process)))
+        })?;
+
+        Ok(no_fail!(ProcessIdentifier, {
+            // Commit reserved identifiers now that all allocations and fallible operations
+            // succeeded.
+            self.next_pid = next_pid;
+            self.tm.commit_next_tid(next_tid);
+            self.live_count += 1;
+
+            // Commit the creation and install the termination credit in the child before enqueueing
+            // it. A forked child is never a system daemon, so classify it from its parent lineage.
+            let role: ProcessRole = self.classify_role(child_pid, pid);
+            let termination_credit = self
+                .delivery
+                .commit_creation(reservation, ProcessCreationInfo::new(child_pid, pid, role));
+            let thread_termination_credit: ThreadLifecycleTerminationCredit =
+                self.delivery.commit_thread_creation(thread_reservation);
+            prepared.install_termination_credit(termination_credit);
+            prepared.install_thread_termination_credit(thread_termination_credit);
+            prepared.enqueue(&mut self.ready);
+
+            Ok(child_pid)
+        }))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Schedule a thread to run.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - The process identifier of the next thread to run.
+    /// - The thread identifier of the next thread to run.
+    /// - A pointer to the context information of the previous thread.
+    /// - A pointer to the context information of the next thread.
+    /// - An optional base address for the user-space thread data area of the next thread to run.
+    ///
+    fn schedule(
+        &mut self,
+    ) -> (
+        ProcessIdentifier,
+        ThreadIdentifier,
+        *mut ContextInformation,
+        *mut ContextInformation,
+        Option<VirtualAddress>,
+    ) {
+        // Check the running thread's kernel stack guard watermark before switching away.
+        self.check_running_stack_guard();
+
+        // Reschedule running process.
+        let previous_process: RunningProcess = self.take_running();
+
+        let (previous_process, previous_context) = previous_process.schedule();
+        self.ready.push_back(previous_process);
+
+        self.check_alarm();
+
+        // Process all interrupted processes.
+        while let Some(interrupted_process) = self.interrupted.pop_front() {
+            let ready_process: RunnableProcess = interrupted_process.resume();
+            self.ready.push_back(ready_process);
+        }
+
+        // Select next process to run.
+        let next_process: RunnableProcess = self.take_earliest_ready();
+
+        let (next_process, reason, next_context, user_tda): (
+            RunningProcess,
+            Option<InterruptReason>,
+            *mut ContextInformation,
+            Option<VirtualAddress>,
+        ) = next_process.run();
+
+        let next_pid: ProcessIdentifier = next_process.state().pid();
+        let next_tid: ThreadIdentifier = next_process.get_tid();
+        self.interrupt_reason = reason;
+        self.running = Some(next_process);
+        self.update_active_stack_guard();
+        (next_pid, next_tid, previous_context, next_context, user_tda)
+    }
+
+    // Traverses the list of sleeping processes, checking for expired alarms and moving processes
+    // whose alarms have expired from the `suspended` to `interrupted` list.
+    fn check_alarm(&mut self) {
+        let now: SystemTime = clock::now();
+
+        // Create a temporary list to store processes that are still sleeping.
+        let mut suspended: LinkedList<SleepingProcess> = LinkedList::new();
+
+        // Filter out processes that are still sleeping.
+        while let Some(process) = self.suspended.pop_front() {
+            // Attempt to wake up process.
+            match process.wakeup_alarm(now) {
+                Ok(interrupted_process) => {
+                    trace!(
+                        "process {:?} interrupted at {now:?}",
+                        interrupted_process.state().pid(),
+                    );
+                    self.interrupted.push_back(interrupted_process);
+                },
+                Err(suspended_process) => suspended.push_back(suspended_process),
+            }
+        }
+
+        // Set the list of sleeping processes.
+        self.suspended = suspended;
+
+        // Service per-thread alarms for processes that remain runnable because they still have
+        // other ready threads. Such a sleeping thread is parked inside the process's own
+        // sleeping-thread list (it never reaches `self.suspended`), so without this its alarm would
+        // never be serviced until the whole process quiesced — letting one CPU-bound sibling thread
+        // starve another thread's timed wait.
+        for process in self.ready.iter_mut() {
+            process.wakeup_expired_alarms(now);
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Suspends the execution of the calling thread and schedules another thread to run.
+    ///
+    /// # Parameters
+    ///
+    /// - `alarm`: Optional alarm time.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - The process identifier of the next thread to run.
+    /// - The thread identifier of the next thread to run.
+    /// - A pointer to the context information of the previous thread.
+    /// - A pointer to the context information of the next thread.
+    /// - An optional base address for the user-space thread data area of the next thread to run.
+    ///
+    fn do_sleep(
+        &mut self,
+        alarm: Option<SystemTime>,
+    ) -> (
+        ProcessIdentifier,
+        ThreadIdentifier,
+        *mut ContextInformation,
+        *mut ContextInformation,
+        Option<VirtualAddress>,
+    ) {
+        // Check the running thread's kernel stack guard watermark before switching away.
+        self.check_running_stack_guard();
+
+        let running_process: RunningProcess = self.take_running();
+
+        // Check if kernel is trying to sleep.
+        if running_process.state().pid() == ProcessIdentifier::KERNEL {
+            panic!("kernel process cannot sleep");
+        }
+
+        // Suspend the execution of the calling thread.
+        let previous_context: *mut ContextInformation = match running_process.sleep(alarm) {
+            // The calling process still has runnable threads, put it in the list of ready processes.
+            Ok((runnable_process, previous_context)) => {
+                self.ready.push_back(runnable_process);
+                previous_context
+            },
+            // The calling process has only sleeping threads left, put it in the list of suspended processes.
+            Err((suspended_process, previous_context)) => {
+                self.suspended.push_back(suspended_process);
+                previous_context
+            },
+        };
+
+        // Schedule another thread to run.
+        let next_process: RunnableProcess = self.take_earliest_ready();
+
+        let (next_process, reason, next_context, user_tda): (
+            RunningProcess,
+            Option<InterruptReason>,
+            *mut ContextInformation,
+            Option<VirtualAddress>,
+        ) = next_process.run();
+
+        let next_pid: ProcessIdentifier = next_process.state().pid();
+        let next_tid: ThreadIdentifier = next_process.get_tid();
+        self.interrupt_reason = reason;
+        self.running = Some(next_process);
+        self.update_active_stack_guard();
+        (next_pid, next_tid, previous_context, next_context, user_tda)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Wakes up a thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: ID of the thread to wake up.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error code is returned instead.
+    ///
+    pub fn do_wakeup(&mut self, tid: ThreadIdentifier) -> Result<(), Error> {
+        if self.try_wakeup_thread(tid) {
+            Ok(())
+        } else {
+            // The wakeup target may legitimately no longer be sleeping by the time we deliver the
+            // notification (e.g., it already woke/timed out, or it exited and was reaped while an
+            // IPC wakeup was still in flight). This is an expected race, so it is logged at TRACE
+            // rather than ERROR while still returning NoSuchEntry for callers to handle.
+            let reason: &str = "thread not found";
+            trace!("{reason} (tid={tid:?})");
+            Err(Error::new(ErrorCode::NoSuchEntry, reason))
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Best-effort wakeup of a single thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: ID of the thread to wake up.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if a sleeping thread with the given identifier was woken, or `false` if no
+    /// such thread is currently in a sleeping state (for example, because it already timed out or
+    /// was woken by another notifier). Unlike [`Self::do_wakeup`], the not-sleeping case is reported
+    /// through the return value rather than an error, so that synchronization primitives can skip
+    /// stale waiters without producing spurious error logs.
+    ///
+    fn try_wakeup_thread(&mut self, tid: ThreadIdentifier) -> bool {
+        // Check if thread belongs to the running process.
+        if self.get_running().find_thread(tid).is_some() {
+            let running_process: RunningProcess = self.take_running();
+            match running_process.wakeup(tid) {
+                Ok(running_process) => {
+                    self.running = Some(running_process);
+                    return true;
+                },
+                Err(running_process) => {
+                    // The thread exists in the running process but is not sleeping (e.g., it was
+                    // already woken). Report this as a no-op rather than an error.
+                    self.running = Some(running_process);
+                    return false;
+                },
+            }
+        }
+
+        // Check if thread belongs to a suspended or ready process.
+        match self.try_wakeup(tid) {
+            Some(runnable_process) => {
+                self.ready.push_back(runnable_process);
+                true
+            },
+            None => false,
+        }
+    }
+
+    fn try_wakeup(&mut self, tid: ThreadIdentifier) -> Option<RunnableProcess> {
+        // Search for the process in the list of sleeping processes.
+        let mut suspended: LinkedList<SleepingProcess> = LinkedList::new();
+        while let Some(process) = self.suspended.pop_front() {
+            // Found.
+            if process.find_thread(tid).is_some() {
+                match process.wakeup(tid) {
+                    Ok(runnable_process) => {
+                        while let Some(process) = suspended.pop_back() {
+                            self.suspended.push_front(process);
+                        }
+                        return Some(runnable_process);
+                    },
+                    Err(suspended_process) => {
+                        self.suspended.push_front(suspended_process);
+                        while let Some(process) = suspended.pop_back() {
+                            self.suspended.push_front(process);
+                        }
+                        return None;
+                    },
+                }
+            } else {
+                suspended.push_back(process)
+            }
+        }
+        // Process is not in the list of sleeping processes, rollback list to its original state.
+        self.suspended = suspended;
+
+        // Search for the process in the list of ready processes.
+        let mut ready: LinkedList<RunnableProcess> = LinkedList::new();
+        while let Some(process) = self.ready.pop_front() {
+            // Found.
+            if process.find_thread(tid).is_some() {
+                match process.wakeup(tid) {
+                    Ok(runnable_process) => {
+                        while let Some(process) = ready.pop_back() {
+                            self.ready.push_front(process);
+                        }
+                        return Some(runnable_process);
+                    },
+                    Err(ready_process) => {
+                        self.ready.push_front(ready_process);
+                        while let Some(process) = ready.pop_back() {
+                            self.ready.push_front(process);
+                        }
+                        return None;
+                    },
+                }
+            } else {
+                ready.push_back(process)
+            }
+        }
+        // Process is not in the list of ready processes, rollback list to its original state.
+        self.ready = ready;
+
+        None
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Replaces the image of the calling (running) process with a new program, following POSIX
+    /// `execv()` semantics. The new address space and main thread are built from `elf`, `args`, and
+    /// `env`; on success the process keeps its identity but resumes execution at the new image's
+    /// entry point on a fresh thread.
+    ///
+    /// All fallible work (building the new address space and thread) is performed before any
+    /// observable change to the process manager, so a failure leaves the calling process intact.
+    /// On success the outgoing thread is retired as a zombie (its kernel stack reaped after the
+    /// switch) and the outgoing address space is queued for deferred reclamation, because it is
+    /// still the active page directory until the caller performs the context switch.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Memory manager to use.
+    /// - `pid`: Identifier of the calling process.
+    /// - `elf_base`: Virtual address of the ELF image within the calling process's address space.
+    /// - `elf_len`: Length of the ELF image in bytes.
+    /// - `args`: Command line arguments for the new image.
+    /// - `env`: Environment for the new image.
+    ///
+    /// # Returns
+    ///
+    /// On success, a tuple is returned containing:
+    /// - The process identifier of the image to run next (unchanged).
+    /// - The thread identifier of the new main thread.
+    /// - A pointer to the context information of the outgoing thread (the "from" side).
+    /// - A pointer to the context information of the new thread (the "to" side).
+    /// - An optional base address for the user-space thread data area of the new thread.
+    ///
+    /// On failure, an error is returned and the calling process is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the kernel process attempts to replace its image, the
+    /// calling process is not single-threaded, the process owns resources that cannot survive an
+    /// image replacement, lifecycle capacity is exhausted, or the new image cannot be prepared.
+    ///
+    /// # Panics
+    ///
+    /// This function panics in debug builds if `pid` does not identify the running process. It also
+    /// panics if lifecycle delivery was disposed, the outgoing or replacement thread does not own
+    /// the expected termination credit, the delivery sequence is exhausted, or the preallocated
+    /// lifecycle queue is full.
+    ///
+    #[allow(clippy::type_complexity)]
+    fn do_execv(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        pid: ProcessIdentifier,
+        elf_base: VirtualAddress,
+        elf_len: usize,
+        args: &str,
+        env: &str,
+    ) -> Result<
+        (
+            ProcessIdentifier,
+            ThreadIdentifier,
+            *mut ContextInformation,
+            *mut ContextInformation,
+            Option<VirtualAddress>,
+        ),
+        Error,
+    > {
+        // Check the running thread's kernel stack guard watermark before doing surgery.
+        self.check_running_stack_guard();
+
+        // The caller must be the running process.
+        debug_assert!(
+            self.get_running().state().pid() == pid,
+            "execv() caller must be the running process"
+        );
+
+        // The kernel process must never execv.
+        if pid == ProcessIdentifier::KERNEL {
+            let reason: &str = "kernel process cannot execv";
+            error!("{reason}");
+            return Err(Error::new(ErrorCode::OperationNotPermitted, reason));
+        }
+
+        // Collapsing sibling threads into the new image is not supported; require a single thread.
+        if !self.get_running().is_single_threaded() {
+            let reason: &str = "execv() is not supported for multithreaded processes";
+            error!("{reason} (pid={pid:?})");
+            return Err(Error::new(ErrorCode::OperationNotPermitted, reason));
+        }
+
+        // Refuse to replace the image when the caller owns special resources that cannot be
+        // carried across an image replacement (mmio/pmio/events/buffered mailbox messages).
+        if self.get_running().state().has_special_resources() {
+            let reason: &str = "caller owns special resources (mmio/pmio/events/mailbox)";
+            error!("{reason} (pid={pid:?})");
+            return Err(Error::new(ErrorCode::OperationNotPermitted, reason));
+        }
+
+        let (reservation, (tid, next_tid, vmem, mut thread)): (
+            ThreadLifecycleReservation,
+            (ThreadIdentifier, ThreadIdentifier, Vmem, ReadyThread),
+        ) = self.prepare_thread_lifecycle_creation(|manager| {
+            // Reserve a thread identifier for the new image's main thread.
+            let (tid, next_tid): (ThreadIdentifier, ThreadIdentifier) =
+                manager.tm.try_next_tid()?;
+
+            // Build the new address space and main thread while the calling image remains intact.
+            let src_vmem: &Vmem = manager.get_running().state().vmem();
+            let (vmem, thread): (Vmem, ReadyThread) = Self::build_user_image(
+                mm,
+                &manager.tm,
+                src_vmem,
+                tid,
+                |mm, dst_vmem| mm.load_elf_from_user(dst_vmem, src_vmem, elf_base, elf_len),
+                args,
+                env,
+                false,
+                manager.interrupt_capable,
+            )?;
+            Ok((tid, next_tid, vmem, thread))
+        })?;
+
+        //==============================================================
+        // Commit. Everything below is infallible.
+        //==============================================================
+
+        Ok(no_fail!(
+            (
+                ProcessIdentifier,
+                ThreadIdentifier,
+                *mut ContextInformation,
+                *mut ContextInformation,
+                Option<VirtualAddress>,
+            ),
+            {
+                let termination_credit: ThreadLifecycleTerminationCredit =
+                    self.delivery.commit_thread_creation(reservation);
+                thread
+                    .thread_state_mut()
+                    .install_termination_credit(termination_credit);
+
+                // Swap the address space and running thread in place, retiring the outgoing
+                // thread.
+                let (old_vmem, old_zombie, pending_termination, from_ctx, to_ctx, user_tda): (
+                    Vmem,
+                    ZombieThread,
+                    PendingThreadTermination,
+                    *mut ContextInformation,
+                    *mut ContextInformation,
+                    Option<VirtualAddress>,
+                ) = self.get_running_mut().replace_image(vmem, thread);
+                Self::commit_thread_termination(&mut self.delivery, pending_termination);
+
+                // The new thread is now live; commit its reserved identifier.
+                self.tm.commit_next_tid(next_tid);
+
+                // The new image's main thread starts fresh, with no pending interrupt reason.
+                self.interrupt_reason = None;
+
+                // Defer reaping of the outgoing thread's kernel stack until after the switch (its
+                // context is still needed as the "from" side of the switch).
+                self.deferred_reap.push((pid, old_zombie));
+
+                // Defer reclamation of the outgoing address space until after the switch loads the
+                // new page directory (the outgoing one is still the active CR3 right now).
+                self.deferred_exec_vmem.push(old_vmem);
+
+                self.update_active_stack_guard();
+
+                Ok((pid, tid, from_ctx, to_ctx, user_tda))
+            }
+        ))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Terminates the calling process.
+    ///
+    /// # Parameters
+    ///
+    /// - `status`: Exit status.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - The process identifier of the next thread to run.
+    /// - The thread identifier of the next thread to run.
+    /// - A pointer to the context information of the previous thread.
+    /// - A pointer to the context information of the next thread.
+    /// - An optional base address for the user-space thread data area of the next thread to run.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the kernel process attempts to exit, process-manager state cannot
+    /// provide a running or ready process during the context switch, a terminating thread or
+    /// process lacks its termination credit, lifecycle delivery was disposed, the delivery sequence
+    /// is exhausted, or the preallocated lifecycle queue is full.
+    ///
+    fn do_exit(
+        &mut self,
+        status: ExitStatus,
+    ) -> (
+        ProcessIdentifier,
+        ThreadIdentifier,
+        *mut ContextInformation,
+        *mut ContextInformation,
+        Option<VirtualAddress>,
+    ) {
+        // Check the running thread's kernel stack guard watermark before switching away.
+        self.check_running_stack_guard();
+
+        let mut running_process: RunningProcess = self.take_running();
+        trace!(
+            "pid={:?}, tid={:?}, status={status:?}",
+            running_process.state().pid(),
+            running_process.get_tid(),
+        );
+
+        // Check if kernel is trying to exit.
+        if running_process.state().pid() == ProcessIdentifier::KERNEL {
+            panic!("kernel process cannot exit");
+        }
+
+        let purged_messages: usize = running_process.state_mut().purge_messages();
+        self.note_messages_purged(purged_messages);
+
+        // Clean up any pending rendezvous entries for this process and wake up counterpart
+        // threads that would otherwise block forever.
+        self.cleanup_rendezvous(running_process.state().pid(), "do_exit");
+
+        // Terminate the calling thread.
+        let previous_context: *mut ContextInformation =
+            match running_process.exit(status, &mut |pending| {
+                Self::commit_thread_termination(&mut self.delivery, pending);
+            }) {
+                // The calling process still has runnable threads, put it in the list of ready processes.
+                Ok((runnable_process, previous_context)) => {
+                    self.ready.push_back(runnable_process);
+                    previous_context
+                },
+                // The calling process has only sleeping threads left, put it in the list of zombies processes.
+                Err((transition, previous_context)) => {
+                    let zombie_process: ZombieProcess = self.commit_zombie_process(transition);
+                    self.zombies.push_back(zombie_process);
+                    previous_context
+                },
+            };
+
+        // Schedule another thread to run.
+        let next_process: RunnableProcess = self.take_earliest_ready();
+
+        let (next_process, reason, next_context, user_tda): (
+            RunningProcess,
+            Option<InterruptReason>,
+            *mut ContextInformation,
+            Option<VirtualAddress>,
+        ) = next_process.run();
+
+        let next_pid: ProcessIdentifier = next_process.state().pid();
+        let next_tid: ThreadIdentifier = next_process.get_tid();
+        self.interrupt_reason = reason;
+        self.running = Some(next_process);
+        self.update_active_stack_guard();
+        (next_pid, next_tid, previous_context, next_context, user_tda)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Terminates the calling thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `status`: Exit status.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - The process identifier of the next thread to run.
+    /// - The thread identifier of the next thread to run.
+    /// - A pointer to the context information of the previous thread.
+    /// - A pointer to the context information of the next thread.
+    /// - An optional base address for the user-space thread data area of the next thread to run.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the kernel process attempts to exit a thread, process-manager state
+    /// cannot provide a running or ready process during the context switch, the terminating thread
+    /// or process lacks its termination credit, lifecycle delivery was disposed, the delivery
+    /// sequence is exhausted, or the preallocated lifecycle queue is full.
+    ///
+    fn do_exit_thread(
+        &mut self,
+        status: ExitStatus,
+    ) -> (
+        ProcessIdentifier,
+        ThreadIdentifier,
+        Condvar,
+        *mut ContextInformation,
+        *mut ContextInformation,
+        Option<VirtualAddress>,
+    ) {
+        // Check the running thread's kernel stack guard watermark before switching away.
+        self.check_running_stack_guard();
+
+        let exiting_tid: ThreadIdentifier = self.get_running().get_tid();
+        // SAFETY: single-core system with interrupts disabled.
+        unsafe { crate::ipc::bulk_pull::cleanup_thread(exiting_tid) };
+        // SAFETY: single-core system with interrupts disabled.
+        let orphaned_tids: ::alloc::vec::Vec<ThreadIdentifier> =
+            unsafe { crate::ipc::rendezvous::cleanup_thread(exiting_tid) };
+        for tid in orphaned_tids {
+            if !self.interrupt_rendezvous_thread(tid) {
+                warn!(
+                    "do_exit_thread(): failed to interrupt orphaned rendezvous thread \
+                     (tid={tid:?})"
+                );
+            }
+        }
+
+        let mut running_process: RunningProcess = self.take_running();
+
+        trace!(
+            "pid={:?}, tid={:?}, status={:?}",
+            running_process.state().pid(),
+            running_process.get_tid(),
+            status
+        );
+
+        // Check if kernel is trying to exit.
+        if running_process.state().pid() == ProcessIdentifier::KERNEL {
+            panic!("kernel process cannot exit (status={status:?})");
+        }
+
+        let purged_messages: usize = running_process
+            .state_mut()
+            .purge_thread_messages(exiting_tid);
+        self.note_messages_purged(purged_messages);
+
+        // Terminate the calling thread and schedule another thread to run.
+        let (join_cond, previous_context): (Condvar, *mut ContextInformation) =
+            match running_process.exit_thread(status, &mut |pending| {
+                Self::commit_thread_termination(&mut self.delivery, pending);
+            }) {
+                // The calling process still has runnable threads, put it in the list of ready processes.
+                (Ok((join_cond, runnable_process, previous_context)), deferred_zombie) => {
+                    let pid: ProcessIdentifier = runnable_process.state().pid();
+                    self.ready.push_back(runnable_process);
+                    if let Some(zombie) = deferred_zombie {
+                        self.deferred_reap.push((pid, zombie));
+                    }
+                    (join_cond, previous_context)
+                },
+                // The calling process has only sleeping threads left, put it in the list of suspended processes.
+                (Err(Ok((join_cond, sleeping_process, previous_context))), deferred_zombie) => {
+                    let pid: ProcessIdentifier = sleeping_process.state().pid();
+                    self.suspended.push_back(sleeping_process);
+                    if let Some(zombie) = deferred_zombie {
+                        self.deferred_reap.push((pid, zombie));
+                    }
+                    (join_cond, previous_context)
+                },
+                // The calling process has only zombie threads left, put it in the list of zombies processes.
+                (Err(Err((join_cond, transition, previous_context))), deferred_zombie) => {
+                    debug_assert!(
+                        deferred_zombie.is_none(),
+                        "deferred zombie must be None when no other threads remain"
+                    );
+                    let mut zombie_process: ZombieProcess = self.commit_zombie_process(transition);
+                    let purged_messages: usize = zombie_process.state_mut().purge_messages();
+                    self.note_messages_purged(purged_messages);
+                    self.zombies.push_back(zombie_process);
+                    (join_cond, previous_context)
+                },
+            };
+
+        // Schedule another thread to run.
+        let next_process: RunnableProcess = self.take_earliest_ready();
+
+        let (next_process, reason, next_context, user_tda): (
+            RunningProcess,
+            Option<InterruptReason>,
+            *mut ContextInformation,
+            Option<VirtualAddress>,
+        ) = next_process.run();
+
+        let next_pid: ProcessIdentifier = next_process.state().pid();
+        let next_tid: ThreadIdentifier = next_process.get_tid();
+        self.interrupt_reason = reason;
+        self.running = Some(next_process);
+        self.update_active_stack_guard();
+        (next_pid, next_tid, join_cond, previous_context, next_context, user_tda)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Terminates a non-running process and marks its remaining threads for termination.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process to terminate.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an [`ErrorCode::InvalidArgument`] error if `pid` identifies the kernel
+    /// or running process, and an [`ErrorCode::NoSuchProcess`] error if the process does not exist.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if an immediately terminating thread or process lacks its termination
+    /// credit, lifecycle delivery was disposed, the delivery sequence is exhausted, or the
+    /// preallocated lifecycle queue is full.
+    ///
+    pub fn terminate(&mut self, pid: ProcessIdentifier) -> Result<(), Error> {
+        // Check if terminating kernel process.
+        if pid == ProcessIdentifier::KERNEL {
+            let reason: &str = "cannot terminate kernel process";
+            error!("{reason}");
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+
+        // Check if target process is running.
+        if self.running.is_some() && self.get_running().state().pid() == pid {
+            let reason: &str = "cannot terminate running process";
+            error!("{reason}");
+            return Err(Error::new(ErrorCode::InvalidArgument, reason));
+        }
+
+        // Clean up any pending rendezvous entries for the terminated process and wake up
+        // counterpart threads that would otherwise block forever.
+        self.cleanup_rendezvous(pid, "terminate");
+
+        // Clear any job-control stopped flag so the doomed process is schedulable again and can run
+        // its own termination; a stopped process is otherwise skipped by the scheduler and could
+        // never complete its exit. The flag is harmless to clear when it was not set.
+        if let Ok(mut process) = self.find_process_mut(pid) {
+            process.state_mut().set_stopped(false);
+        }
+
+        // Check if target process is ready.
+        if let Some(process) = self.ready.iter().position(|p| p.state().pid() == pid) {
+            let process: RunnableProcess = self.ready.remove(process);
+            match process.terminate(&mut |pending| {
+                Self::commit_thread_termination(&mut self.delivery, pending);
+            }) {
+                Ok(interrupted_process) => {
+                    let runnable_process: RunnableProcess = interrupted_process.resume();
+                    self.ready.push_back(runnable_process);
+                    return Ok(());
+                },
+                Err(transition) => {
+                    let zombie_process: ZombieProcess = self.commit_zombie_process(transition);
+                    self.zombies.push_back(zombie_process);
+                    return Ok(());
+                },
+            }
+        }
+
+        // Check if target process is suspended.
+        if let Some(process) = self.suspended.iter().position(|p| p.state().pid() == pid) {
+            let process: SleepingProcess = self.suspended.remove(process);
+            let process: InterruptedProcess = process.terminate();
+            self.interrupted.push_back(process);
+            return Ok(());
+        }
+
+        // Check if target process is already interrupted.
+        if let Some(process) = self.interrupted.iter().position(|p| p.state().pid() == pid) {
+            let process: InterruptedProcess = self.interrupted.remove(process);
+            self.interrupted.push_back(process.terminate());
+            return Ok(());
+        }
+
+        let reason: &str = "process not found";
+        error!("{reason}");
+        Err(Error::new(ErrorCode::NoSuchProcess, reason))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Sets/clears a capability of a process on behalf of that same process.
+    ///
+    /// Acquiring a capability is authorized by the [`ProcessRole`] that the kernel assigned to the
+    /// process when it created it, an authority that cannot itself be obtained through this
+    /// function. Only processes that the kernel spawned directly (the init process and registered
+    /// system daemons) may acquire capabilities; a process forked from a user process may not, so
+    /// it cannot escalate its own privileges. Relinquishing a capability is always permitted,
+    /// because it can only reduce the privileges of the process.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process whose capability is set/cleared, which is also the
+    ///   process requesting the change.
+    /// - `capability`: Capability to set/clear.
+    /// - `set`: Set capability if true, clear capability if false.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error code is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// This function fails with the following error codes:
+    ///
+    /// - [`ErrorCode::NoSuchProcess`]: `pid` does not identify an existing process.
+    /// - [`ErrorCode::PermissionDenied`]: `set` is true and the process is not allowed to acquire
+    ///   capabilities.
+    /// - [`ErrorCode::ResourceBusy`]: `set` is true and the capability is already set.
+    /// - [`ErrorCode::NoSuchEntry`]: `set` is false and the capability is not set.
+    ///
+    pub fn capctl(
+        &mut self,
+        pid: ProcessIdentifier,
+        capability: Capability,
+        set: bool,
+    ) -> Result<(), Error> {
+        // Authorize acquisitions before borrowing the target process mutably.
+        if set {
+            let parent: ProcessIdentifier = self.find_process(pid)?.state().ppid();
+            let role: ProcessRole = self.classify_role(pid, parent);
+            if !Self::may_acquire_capabilities(role) {
+                let reason: &str = "process is not allowed to acquire capabilities";
+                error!("{reason} (pid={pid:?}, role={role:?}, capability={capability:?})");
+                return Err(Error::new(ErrorCode::PermissionDenied, reason));
+            }
+        }
+
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+
+        // Check whether the capability should be set or cleared.
+        if set {
+            // Check if capability is already set.
+            if process.state_mut().has_capability(capability) {
+                let reason: &str = "capability already set";
+                error!("{reason}");
+                return Err(Error::new(ErrorCode::ResourceBusy, reason));
+            }
+            process.state_mut().set_capability(capability);
+        } else {
+            // Check if capability is not set.
+            if !process.state_mut().has_capability(capability) {
+                let reason: &str = "capability not set";
+                error!("{reason}");
+                return Err(Error::new(ErrorCode::NoSuchEntry, reason));
+            }
+            process.state_mut().clear_capability(capability);
+        }
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Handles an FPU exception by saving and restoring the FPU state of the current and previous
+    /// FPU owner threads.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error code is returned instead.
+    ///
+    pub fn handle_fpu_exception(&mut self) -> Result<(), Error> {
+        use crate::{
+            hal::arch::x86::cpu::FpuState,
+            pm::{
+                process::manager::r#unsafe::{
+                    CURRENT_TID,
+                    FPU_OWNER_TID,
+                },
+                ORDER,
+            },
+        };
+
+        // Clear CR0.TS to re-enable FPU/SSE instructions.
+        unsafe { hal::arch::clear_task_switched() };
+
+        let current_tid: ThreadIdentifier = CURRENT_TID.load(ORDER).into();
+
+        let current_fpu_state: *mut FpuState =
+            match self.get_running_mut().find_thread_mut(current_tid) {
+                Some(mut running) => running.thread_state_mut().fpu_state_mut(),
+                None => {
+                    let reason: &str = "no running process";
+                    error!("{reason} (tid={current_tid:?})");
+                    return Err(Error::new(ErrorCode::NoSuchEntry, reason));
+                },
+            };
+
+        let previous_fpu_owner: ThreadIdentifier = FPU_OWNER_TID.load(ORDER).into();
+
+        let previous_fpu_state: Option<*mut FpuState> = if previous_fpu_owner == current_tid {
+            // Current thread is already the FPU owner, nothing to do.
+            return Ok(());
+        } else {
+            match self.find_thread_mut(previous_fpu_owner) {
+                Ok(mut thread) => Some(thread.thread_state_mut().fpu_state_mut()),
+                _ => None,
+            }
+        };
+
+        // Save the previous thread's FPU state if there was a previous owner that used FPU.
+        if let Some(prev_state) = previous_fpu_state {
+            unsafe { FpuState::save(prev_state) };
+        }
+
+        // Current thread has used FPU before, restore its state.
+        unsafe { FpuState::restore(current_fpu_state) };
+
+        FPU_OWNER_TID.store(current_tid.into(), ORDER);
+
+        Ok(())
+    }
+
+    fn interrupt_reason(&mut self) -> Option<InterruptReason> {
+        self.interrupt_reason.take()
+    }
+
+    fn pop_zombie_process(
+        &mut self,
+    ) -> Option<(VecDeque<ZombieThread>, Box<ProcessState>, ExitStatus)> {
+        if let Some(zombie) = self.zombies.pop_front() {
+            let (zombie_threads, state, status): (
+                NonEmptyVecDeque<ZombieThread>,
+                Box<ProcessState>,
+                ExitStatus,
+            ) = zombie.bury();
+            let (mut more_zombie_threads, zombie_thread): (VecDeque<ZombieThread>, ZombieThread) =
+                zombie_threads.pop_front();
+            more_zombie_threads.push_front(zombie_thread);
+
+            // The kernel process is never reaped, so live_count must stay at least 1.
+            if self.live_count <= 1 {
+                unreachable!("live_count underflow: kernel process must always remain counted");
+            }
+            self.live_count -= 1;
+
+            Some((more_zombie_threads, state, status))
+        } else {
+            None
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn try_join_thread(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+    ) -> Result<ZombieThread, Result<Condvar, Error>> {
+        match self.find_process_mut(pid).map_err(Err)? {
+            ProcessRefMut::Running(process) => process.try_join_thread(tid),
+            ProcessRefMut::Runnable(_) => {
+                let reason: &str = "process is runnable";
+                error!("{reason} (pid={pid:?}, tid={tid:?})");
+                Err(Err(Error::new(ErrorCode::OperationNotPermitted, reason)))
+            },
+            ProcessRefMut::Sleeping(_) => {
+                let reason: &str = "process is sleeping";
+                error!("{reason} (pid={pid:?}, tid={tid:?})");
+                Err(Err(Error::new(ErrorCode::OperationNotPermitted, reason)))
+            },
+            ProcessRefMut::Interrupted(_) => {
+                let reason: &str = "process is interrupted";
+                error!("{reason} (pid={pid:?}, tid={tid:?})");
+                Err(Err(Error::new(ErrorCode::OperationNotPermitted, reason)))
+            },
+            ProcessRefMut::Zombie(_) => {
+                let reason: &str = "process is a zombie";
+                error!("{reason} (pid={pid:?}, tid={tid:?})");
+                Err(Err(Error::new(ErrorCode::OperationNotPermitted, reason)))
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Detaches a thread in the calling process. A detached thread is auto-harvested when it exits.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Process identifier of the calling process.
+    /// - `tid`: Thread identifier of the thread to detach.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns `Ok(None)` if the thread was marked detached, or `Ok(Some(zombie))` if
+    /// the thread was already a zombie and should be harvested immediately. On failure, returns an
+    /// error.
+    ///
+    fn do_detach_thread(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+    ) -> Result<Option<ZombieThread>, Error> {
+        match self.find_process_mut(pid) {
+            Ok(ProcessRefMut::Running(process)) => process.detach_thread(tid),
+            Ok(_process_ref) => {
+                let reason: &str = "process is not running";
+                error!("{reason} (pid={pid:?}, tid={tid:?})");
+                Err(Error::new(ErrorCode::OperationNotPermitted, reason))
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns a mutex that is associated with the given address.
+    ///
+    /// # Parameters
+    ///
+    /// - `mutex_addr`: Address of the mutex.
+    ///
+    /// # Returns
+    ///
+    /// On success, the mutex that is associated with the given address is returned. If no mutex is
+    /// associated with the given address, a new mutex is created and returned. On failure, an error
+    /// is returned instead.
+    ///
+    fn lookup_mutex(&mut self, mutex_addr: MutexAddress) -> Result<Mutex, Error> {
+        self.get_running_mut().state_mut().get_mutex(mutex_addr)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns a condition variable that is associated with the given address.
+    ///
+    /// # Parameters
+    ///
+    /// - `cond_addr`: Address of the condition variable.
+    ///
+    /// # Returns
+    ///
+    /// On success, the condition variable that is associated with the given address is returned. If
+    /// no condition variable is associated with the given address, a new condition variable is
+    /// created and returned. On failure, an error is returned instead.
+    ///
+    fn lookup_cond(&mut self, cond_addr: ConditionAddress) -> Result<Condvar, Error> {
+        self.get_running_mut().state_mut().get_cond(cond_addr)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Releases a condition variable previously acquired by the calling thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `cond_addr`: Address of the condition variable.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error is returned instead.
+    ///
+    fn release_cond(&mut self, cond_addr: ConditionAddress) -> Result<(), Error> {
+        self.get_running_mut().state_mut().put_cond(cond_addr)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Stores a mutex guard in the calling thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `mutex_addr`: Address of the mutex.
+    /// - `guard`: Mutex guard to store.
+    ///
+    fn store_mutex_guard(&mut self, mutex_addr: MutexAddress, guard: MutexGuard) {
+        self.get_running_mut()
+            .running_mut()
+            .put_mutex_guard(mutex_addr, guard);
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Takes a mutex guard from a thread.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Process identifier.
+    /// - `tid`: Thread identifier.
+    /// - `mutex_addr`: Address of the mutex.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, the mutex guard is returned. Otherwise, an error is returned
+    /// instead.
+    ///
+    fn remove_mutex_guard(
+        &mut self,
+        pid: ProcessIdentifier,
+        tid: ThreadIdentifier,
+        mutex_addr: MutexAddress,
+    ) -> Result<MutexGuard, Error> {
+        let mutex_guard: MutexGuard = match self
+            .get_running_mut()
+            .running_mut()
+            .take_mutex_guard(mutex_addr)
+        {
+            Some(mutex_guard) => mutex_guard,
+            None => {
+                let reason: &str = "thread does not own mutex";
+                error!("{reason} (pid={pid:?}, tid={tid:?})");
+                return Err(Error::new(ErrorCode::OperationNotPermitted, reason));
+            },
+        };
+
+        self.get_running_mut().state_mut().put_mutex(mutex_addr)?;
+
+        Ok(mutex_guard)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Reserves the next process identifier, performing a checked increment.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, this function returns a tuple containing the reserved [`ProcessIdentifier`]
+    /// and the next [`ProcessIdentifier`] value. The caller must commit the next identifier by
+    /// updating `self.next_pid` after all fallible operations have succeeded.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the process identifier would overflow.
+    ///
+    /// # Known Bugs
+    ///
+    /// - FIXME (#1440): process identifiers are never recycled, so a fork bomb or repeated
+    ///   `create_process` calls can exhaust the identifier space.
+    ///
+    fn try_next_pid(&self) -> Result<(ProcessIdentifier, ProcessIdentifier), Error> {
+        let pid: ProcessIdentifier = self.next_pid;
+        let raw_pid: i32 = i32::from(pid);
+        let next_raw_pid: i32 = match raw_pid.checked_add(1) {
+            Some(val) => val,
+            None => {
+                let reason: &str = "process identifier overflow";
+                error!("{reason} (next_pid={raw_pid:?})");
+                return Err(Error::new(ErrorCode::ValueOverflow, reason));
+            },
+        };
+        Ok((pid, ProcessIdentifier::from(next_raw_pid)))
+    }
+
+    fn take_earliest_ready(&mut self) -> RunnableProcess {
+        // Select the ready process with the earliest admission time, skipping job-control *stopped*
+        // processes (which remain on the ready list but must not run until continued by `SIGCONT`).
+        // The kernel process is never stopped and is always runnable, so a non-stopped candidate
+        // always exists.
+        let mut selected: Option<(usize, SystemTime)> = None;
+        for (i, process) in self.ready.iter().enumerate() {
+            if process.state().is_stopped() {
+                continue;
+            }
+            let process_admission_time: SystemTime = process.earliest_admission_time();
+            match selected {
+                Some((_, earliest)) if earliest <= process_admission_time => {},
+                _ => selected = Some((i, process_admission_time)),
+            }
+        }
+
+        let index: usize = selected
+            .expect("there should always be a non-stopped process ready to run")
+            .0;
+
+        // Remove the selected process from the list of ready processes.
+        self.ready.remove(index)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Checks the running thread's kernel stack guard watermark for corruption.
+    /// If corrupted, logs an error and halts the VM immediately.
+    ///
+    fn check_running_stack_guard(&self) {
+        // Skip when serving an exception: the stack may already be overflowed and
+        // the halt path would aggravate the situation by consuming more stack.
+        if Self::is_serving_exception() {
+            return;
+        }
+
+        if let Some(ref running) = self.running {
+            if let Err(_e) = running.check_guard_watermark() {
+                // Do NOT panic here. A panic formats debug information via core::fmt, which
+                // allocates a large stack frame. When this function is called from do_schedule
+                // (invoked by the timer interrupt handler), the kernel stack is already near its
+                // limit. The additional stack consumed by panic formatting can corrupt page
+                // directory entries, triggering a recursive exception cascade (triple fault).
+                //
+                // Instead, log a fixed-size message and halt immediately. The error! macro and
+                // platform::shutdown use minimal stack compared to panic! formatting.
+                error!(
+                    "stack overflow detected: tid={:?}, pid={:?}",
+                    running.get_tid(),
+                    running.state().pid(),
+                );
+                platform::shutdown(ExitStatus::STACK_OVERFLOW_WATERMARK.into());
+            }
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Updates the assembly-level stack overflow guard to match the currently-active kernel stack.
+    /// Called after setting `self.running` in every scheduling path.
+    ///
+    fn update_active_stack_guard(&self) {
+        #[cfg(feature = "exception-stack-guard")]
+        {
+            if let Some(ref running) = self.running {
+                if let Some(threshold) = running.guard_threshold() {
+                    crate::mm::kstack::set_active_guard(threshold);
+                    return;
+                }
+            }
+
+            // When there is no running process or no guard threshold, clear the guard so that
+            // a stale threshold from a previous stack does not trigger a false overflow.
+            crate::mm::kstack::set_active_guard(0);
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Cleans up pending rendezvous push/pull entries for a process and wakes up counterpart
+    /// threads that would otherwise block forever. This is called during both voluntary exit
+    /// (`do_exit`) and forced termination (`terminate`).
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Process identifier of the exiting/terminated process.
+    /// - `caller`: Label used in log messages to identify the call site.
+    ///
+    fn cleanup_rendezvous(&mut self, pid: ProcessIdentifier, caller: &str) {
+        // SAFETY: single-core system with interrupts disabled.
+        unsafe { crate::ipc::bulk_pull::cleanup_process(pid) };
+        // SAFETY: single-core system with interrupts disabled.
+        let orphaned_tids: ::alloc::vec::Vec<ThreadIdentifier> =
+            unsafe { crate::ipc::rendezvous::cleanup_process(pid) };
+        for tid in orphaned_tids {
+            if !self.interrupt_rendezvous_thread(tid) {
+                warn!("{caller}(): failed to interrupt orphaned rendezvous thread (tid={tid:?})");
+            }
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Interrupts a sleeping rendezvous thread so its kernel call returns an error.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Identifier of the sleeping counterpart thread.
+    ///
+    /// # Returns
+    ///
+    /// `true` is returned if the thread was interrupted. Otherwise, `false` is returned.
+    ///
+    fn interrupt_rendezvous_thread(&mut self, tid: ThreadIdentifier) -> bool {
+        let reason: InterruptReason = InterruptReason::TimedOut;
+
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.find_thread(tid).is_some())
+        {
+            let running: RunningProcess = self.take_running();
+            return match running.interrupt_thread(tid, reason) {
+                Ok(running) => {
+                    self.running = Some(running);
+                    true
+                },
+                Err(running) => {
+                    self.running = Some(running);
+                    false
+                },
+            };
+        }
+
+        let mut suspended: LinkedList<SleepingProcess> = LinkedList::new();
+        while let Some(process) = self.suspended.pop_front() {
+            if process.find_thread(tid).is_some() {
+                let interrupted: bool = match process.interrupt_thread(tid, reason) {
+                    Ok(process) => {
+                        self.ready.push_back(process.resume());
+                        true
+                    },
+                    Err(process) => {
+                        self.suspended.push_front(process);
+                        false
+                    },
+                };
+                while let Some(process) = suspended.pop_back() {
+                    self.suspended.push_front(process);
+                }
+                return interrupted;
+            }
+            suspended.push_back(process);
+        }
+        self.suspended = suspended;
+
+        let mut ready: LinkedList<RunnableProcess> = LinkedList::new();
+        while let Some(process) = self.ready.pop_front() {
+            if process.find_thread(tid).is_some() {
+                let interrupted: bool = match process.interrupt_thread(tid, reason) {
+                    Ok(process) => {
+                        self.ready.push_front(process);
+                        true
+                    },
+                    Err(process) => {
+                        self.ready.push_front(process);
+                        false
+                    },
+                };
+                while let Some(process) = ready.pop_back() {
+                    self.ready.push_front(process);
+                }
+                return interrupted;
+            }
+            ready.push_back(process);
+        }
+        self.ready = ready;
+        false
+    }
+
+    fn take_running(&mut self) -> RunningProcess {
+        // NOTE: it is safe to call unwrap because there is always a process running.
+        self.running.take().expect("the kernel should be running")
+    }
+
+    fn get_running(&self) -> &RunningProcess {
+        // NOTE: it is safe to call unwrap because there is always a process running.
+        self.running.as_ref().expect("the kernel should be running")
+    }
+
+    fn get_running_mut(&mut self) -> &mut RunningProcess {
+        // NOTE: it is safe to call unwrap because there is always a process running.
+        self.running.as_mut().expect("the kernel should be running")
+    }
+
+    fn find_process(&self, pid: ProcessIdentifier) -> Result<ProcessRef<'_>, Error> {
+        if self.get_running().state().pid() == pid {
+            Ok(ProcessRef::Running(self.get_running()))
+        } else if let Some(process) = self.ready.iter().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRef::Runnable(process))
+        } else if let Some(process) = self.suspended.iter().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRef::Sleeping(process))
+        } else if let Some(process) = self.interrupted.iter().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRef::Interrupted(process))
+        } else if let Some(process) = self.zombies.iter().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRef::Zombie(process))
+        } else {
+            let reason: &str = "process not found";
+            error!("{reason} (pid={pid:?})");
+            Err(Error::new(ErrorCode::NoSuchProcess, reason))
+        }
+    }
+
+    fn find_process_mut(&mut self, pid: ProcessIdentifier) -> Result<ProcessRefMut<'_>, Error> {
+        if self.get_running_mut().state().pid() == pid {
+            Ok(ProcessRefMut::Running(self.get_running_mut()))
+        } else if let Some(process) = self.ready.iter_mut().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRefMut::Runnable(process))
+        } else if let Some(process) = self.suspended.iter_mut().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRefMut::Sleeping(process))
+        } else if let Some(process) = self.interrupted.iter_mut().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRefMut::Interrupted(process))
+        } else if let Some(process) = self.zombies.iter_mut().find(|p| p.state().pid() == pid) {
+            Ok(ProcessRefMut::Zombie(process))
+        } else {
+            let reason: &str = "process not found";
+            error!("{reason} (pid={pid:?})");
+            Err(Error::new(ErrorCode::NoSuchProcess, reason))
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Finds a process by looking for a thread identifier.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Thread identifier to search for.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, a mutable reference to the process containing the thread is
+    /// returned.  Otherwise, an error code is returned instead.
+    ///
+    fn find_process_by_tid(&mut self, tid: ThreadIdentifier) -> Result<ProcessRefMut<'_>, Error> {
+        if self.get_running_mut().find_thread(tid).is_some() {
+            Ok(ProcessRefMut::Running(self.get_running_mut()))
+        } else if let Some(process) = self.ready.iter_mut().find(|p| p.find_thread(tid).is_some()) {
+            Ok(ProcessRefMut::Runnable(process))
+        } else if let Some(process) = self
+            .suspended
+            .iter_mut()
+            .find(|p| p.find_thread(tid).is_some())
+        {
+            Ok(ProcessRefMut::Sleeping(process))
+        } else if let Some(process) = self
+            .interrupted
+            .iter_mut()
+            .find(|p| p.find_thread(tid).is_some())
+        {
+            Ok(ProcessRefMut::Interrupted(process))
+        } else if let Some(process) = self
+            .zombies
+            .iter_mut()
+            .find(|p| p.find_thread(tid).is_some())
+        {
+            Ok(ProcessRefMut::Zombie(process))
+        } else {
+            let reason: &str = "thread not found";
+            error!("{reason} (tid={tid:?})");
+            Err(Error::new(ErrorCode::NoSuchEntry, reason))
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Ensures that a thread identifier names a live thread that can participate in a rendezvous.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Thread identifier to validate.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, empty is returned.
+    ///
+    /// # Errors
+    ///
+    /// This function returns [`ErrorCode::NoSuchEntry`] if the thread does not exist or is a
+    /// zombie.
+    ///
+    pub fn ensure_live_thread(&mut self, tid: ThreadIdentifier) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_by_tid(tid)?;
+        if matches!(&process, ProcessRefMut::Zombie(_))
+            || matches!(process.find_thread_mut(tid), Some(ThreadRefMut::Zombie(_)) | None)
+        {
+            let reason: &str = "rendezvous destination thread is not live";
+            return Err(Error::new(ErrorCode::NoSuchEntry, reason));
+        }
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns whether a thread currently sleeps inside a blocking kernel operation.
+    ///
+    /// # Parameters
+    ///
+    /// - `tid`: Thread identifier to inspect.
+    ///
+    /// # Returns
+    ///
+    /// `true` is returned if the thread is sleeping. Otherwise, `false` is returned.
+    ///
+    pub fn is_thread_sleeping(&self, tid: ThreadIdentifier) -> bool {
+        if matches!(self.get_running().find_thread(tid), Some(ThreadRef::Sleeping(_))) {
+            return true;
+        }
+        self.ready
+            .iter()
+            .any(|process| matches!(process.find_thread(tid), Some(ThreadRef::Sleeping(_))))
+            || self
+                .suspended
+                .iter()
+                .any(|process| matches!(process.find_thread(tid), Some(ThreadRef::Sleeping(_))))
+            || self
+                .interrupted
+                .iter()
+                .any(|process| matches!(process.find_thread(tid), Some(ThreadRef::Sleeping(_))))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Finds a thread.
+    ///
+    /// # Arguments
+    ///
+    /// - `tid`: Identifier of the thread to find.
+    ///
+    /// # Returns
+    ///
+    /// If a thread that matches the specified thread identifier is found, then a mutable reference
+    /// to it is returned. Otherwise, empty is returned instead.
+    ///
+    fn find_thread_mut(&mut self, tid: ThreadIdentifier) -> Result<ThreadRefMut<'_>, Error> {
+        // Search thread in the running process.
+        if let Some(thread) = self.running.as_mut() {
+            if let Some(thread) = thread.find_thread_mut(tid) {
+                return Ok(thread);
+            }
+        }
+
+        // Search thread in the list of ready processes.
+        for process in self.ready.iter_mut() {
+            if let Some(thread) = process.find_thread_mut(tid) {
+                return Ok(thread);
+            }
+        }
+
+        // Search thread in the list of sleeping processes.
+        for process in self.suspended.iter_mut() {
+            if let Some(thread) = process.find_thread_mut(tid) {
+                return Ok(thread);
+            }
+        }
+
+        // Search thread in the list of interrupted processes.
+        for process in self.interrupted.iter_mut() {
+            if let Some(thread) = process.find_thread_mut(tid) {
+                return Ok(thread);
+            }
+        }
+
+        // Search thread in the list of zombie processes.
+        for process in self.zombies.iter_mut() {
+            if let Some(thread) = process.find_thread_mut(tid) {
+                return Ok(thread);
+            }
+        }
+
+        // The thread may have already been reaped while a lookup was in flight (e.g. an FPU-owner
+        // lookup after the owning thread exited). This is an expected, benign race, so it is logged
+        // at TRACE rather than ERROR while still returning NoSuchEntry for callers to handle.
+        let reason: &str = "thread not found";
+        trace!("{reason} (tid={tid:?})");
+        Err(Error::new(ErrorCode::NoSuchEntry, reason))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Notes that a message was posted.
+    ///
+    /// # Parameters
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// An error if and only if incrementing by one would overflow the number of buffered messages.
+    ///
+    pub fn note_message_posted(&mut self) -> Result<(), Error> {
+        match self.number_buffered_messages.checked_add(1) {
+            Some(n) => {
+                self.number_buffered_messages = n;
+                Ok(())
+            },
+            None => {
+                error!("number of buffered messages overflowed");
+                Err(Error::new(ErrorCode::ValueOverflow, "number of buffered messages overflowed"))
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Notes that a message was received.
+    ///
+    /// # Parameters
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// An error if and only if decrementing by one would underflow the number of buffered messages.
+    ///
+    pub fn note_message_received(&mut self) -> Result<(), Error> {
+        match self.number_buffered_messages.checked_sub(1) {
+            Some(n) => {
+                self.number_buffered_messages = n;
+                Ok(())
+            },
+            None => {
+                error!("number of buffered messages underflowed");
+                Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    "number of buffered messages underflowed",
+                ))
+            },
+        }
+    }
+
+    /// Removes purged messages from the global buffered-message count.
+    fn note_messages_purged(&mut self, purged_messages: usize) {
+        match self.number_buffered_messages.checked_sub(purged_messages) {
+            Some(n) => self.number_buffered_messages = n,
+            None => {
+                error!(
+                    "number of buffered messages underflowed while purging (buffered={}, \
+                     purged={})",
+                    self.number_buffered_messages, purged_messages
+                );
+                self.number_buffered_messages = 0;
+            },
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the number of messages that have been posted but not yet received.
+    ///
+    /// # Parameters
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// The count of buffered messages.
+    ///
+    #[cfg(feature = "stdio")]
+    pub fn number_buffered_messages(&self) -> usize {
+        self.number_buffered_messages
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the ID of the calling process.
+    ///
+    /// # Returns
+    ///
+    /// The ID of the calling process.
+    ///
+    pub fn get_pid(&self) -> ProcessIdentifier {
+        self.get_running().state().pid()
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the ID of the parent of the calling process.
+    ///
+    /// # Returns
+    ///
+    /// The ID of the parent of the calling process.
+    ///
+    pub fn get_ppid(&self) -> ProcessIdentifier {
+        self.get_running().state().ppid()
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the ID of the calling thread.
+    ///
+    /// # Returns
+    ///
+    /// The ID of the calling thread.
+    ///
+    pub fn get_tid(&self) -> ThreadIdentifier {
+        self.get_running().get_tid()
+    }
+
+    pub fn has_capability(
+        &self,
+        pid: ProcessIdentifier,
+        capability: Capability,
+    ) -> Result<bool, Error> {
+        Ok(self.find_process(pid)?.state().has_capability(capability))
+    }
+
+    pub fn vmcopy_from_user(
+        &mut self,
+        pid: ProcessIdentifier,
+        dst: VirtualAddress,
+        src: VirtualAddress,
+        size: usize,
+    ) -> Result<(), Error> {
+        self.find_process_mut(pid)?
+            .state_mut()
+            .copy_from_user_unaligned(dst, src, size)
+    }
+
+    pub fn vmcopy_to_user(
+        &mut self,
+        pid: ProcessIdentifier,
+        dst: VirtualAddress,
+        src: VirtualAddress,
+        size: usize,
+    ) -> Result<(), Error> {
+        self.find_process_mut(pid)?
+            .state_mut()
+            .copy_to_user_unaligned(dst, src, size)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Copies data directly between the user spaces of two processes.
+    ///
+    /// # Parameters
+    ///
+    /// - `src_pid`: Source process identifier.
+    /// - `src`: Source address in `src_pid`'s user space.
+    /// - `dst_pid`: Destination process identifier.
+    /// - `dst`: Destination address in `dst_pid`'s user space.
+    /// - `size`: Number of bytes to copy.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. On failure, an error is returned instead.
+    ///
+    pub fn vmcopy_user_to_user(
+        &mut self,
+        src_pid: ProcessIdentifier,
+        src: VirtualAddress,
+        dst_pid: ProcessIdentifier,
+        dst: VirtualAddress,
+        size: usize,
+    ) -> Result<(), Error> {
+        // Eagerly resolve any copy-on-write mappings in the destination region before the
+        // copy. The byte-copy path below targets the destination frames via their physical
+        // alias, which bypasses the page-table read-only/CoW bits, so the resolution must
+        // happen here rather than on the page-fault path.
+        if size > 0 {
+            let mut dst_proc = self.find_process_mut(dst_pid)?;
+            dst_proc
+                .state_mut()
+                .vmem_mut()
+                .resolve_cow_for_region(dst, size)?;
+        }
+
+        let src_proc: ProcessRef<'_> = self.find_process(src_pid)?;
+        let dst_proc: ProcessRef<'_> = self.find_process(dst_pid)?;
+        let src_vmem: &Vmem = src_proc.state().vmem();
+        let dst_vmem: &Vmem = dst_proc.state().vmem();
+        Vmem::copy_user_to_user(src_vmem, src, dst_vmem, dst, size)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Translates a user-space virtual address to a guest physical address for a given process.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Process whose page tables should be walked.
+    /// - `vaddr`: User-space virtual address to translate.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the guest physical address is returned. Upon failure, an error is returned.
+    ///
+    #[cfg(feature = "stdio")]
+    pub fn user_vaddr_to_paddr(
+        &self,
+        pid: ProcessIdentifier,
+        vaddr: VirtualAddress,
+    ) -> Result<usize, Error> {
+        let proc_ref: ProcessRef<'_> = self.find_process(pid)?;
+        proc_ref.state().vmem().user_vaddr_to_paddr(vaddr)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Commits a pending thread termination to the ordered delivery broker.
+    ///
+    /// # Parameters
+    ///
+    /// - `delivery`: Delivery broker that receives the termination record.
+    /// - `pending`: Pending thread termination and its reserved capacity credit.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if lifecycle delivery was disposed, the delivery sequence is exhausted,
+    /// or the preallocated lifecycle queue is full.
+    ///
+    fn commit_thread_termination(delivery: &mut DeliveryBroker, pending: PendingThreadTermination) {
+        let (info, credit) = pending.into_parts();
+        delivery.commit_thread_termination(credit, info);
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Commits a process termination at zombie-process creation and returns the zombie.
+    ///
+    /// # Parameters
+    ///
+    /// - `transition`: Zombie-process transition containing the process and pending termination.
+    ///
+    /// # Returns
+    ///
+    /// The zombie process whose termination record was committed.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if lifecycle delivery was disposed, the delivery sequence is exhausted,
+    /// or the preallocated lifecycle queue is full.
+    ///
+    fn commit_zombie_process(&mut self, transition: ZombieProcessTransition) -> ZombieProcess {
+        let (zombie, pending): (ZombieProcess, PendingProcessTermination) = transition.into_parts();
+        let (pid, parent, status, credit) = pending.into_parts();
+        let role: ProcessRole = self.classify_role(pid, parent);
+        self.delivery
+            .commit_termination(credit, ProcessTerminationInfo::new(pid, status, parent, role));
+        zombie
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Disposes lifecycle state that cannot be delivered after terminal kernel shutdown begins.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if lifecycle state was already disposed or its reservation accounting
+    /// is inconsistent.
+    ///
+    pub(crate) fn dispose_lifecycle(&mut self) {
+        let disposal: LifecycleDisposal = self.delivery.dispose();
+        if disposal.undelivered_records != 0 || disposal.retained_reservations != 0 {
+            warn!(
+                "disposed lifecycle state at shutdown (undelivered_records={}, \
+                 retained_reservations={})",
+                disposal.undelivered_records, disposal.retained_reservations
+            );
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Reports whether lifecycle records are buffered in the delivery broker.
+    ///
+    /// # Returns
+    ///
+    /// `true` if lifecycle records are buffered, otherwise `false`.
+    ///
+    pub fn has_pending_lifecycle(&self) -> bool {
+        self.delivery.has_lifecycle()
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Requests a deferred wakeup of the lifecycle owner when records are buffered.
+    ///
+    pub fn request_lifecycle_wakeup(&mut self) {
+        self.delivery.request_lifecycle_wakeup();
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Takes the pending lifecycle-owner wakeup request, clearing it in the process.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a wakeup request was pending, otherwise `false`.
+    ///
+    pub fn take_lifecycle_wakeup_request(&mut self) -> bool {
+        self.delivery.take_lifecycle_wakeup_request()
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Reaps pending process zombies on demand to reclaim thread (and process) slots when thread
+    /// admission would otherwise fail. Zombies are normally harvested lazily in the kernel idle
+    /// loop ([`crate::kcall::handler::kcall_handler`]); a workload that terminates children faster
+    /// than it quiesces can therefore exhaust the system-wide thread cap with
+    /// terminated-but-unharvested zombies. Draining them here turns a spurious
+    /// [`ErrorCode::OutOfMemory`] into successful admission.
+    ///
+    /// Thread slots can also be held by detached-thread zombies queued in `deferred_reap`, which
+    /// are normally reclaimed by [`Self::reap_deferred`] at PM entry points once the context switch
+    /// that produced them has completed. Those are drained here as well (via
+    /// [`Self::reap_deferred_zombie_threads`]) so that detached threads do not reintroduce the same
+    /// spurious exhaustion.
+    ///
+    /// The process manager daemon ([`ProcessIdentifier::PROCD`]) is never reaped here. Harvesting
+    /// PROCD is the kernel's shutdown signal, which is observed only by the idle-loop harvester
+    /// ([`crate::kcall::handler::kcall_handler`]). Reaping it on this path would consume that
+    /// signal, buffering an ordinary termination event and leaving shutdown to never be observed.
+    /// Because the zombie queue is processed in FIFO order, this stops as soon as PROCD reaches the
+    /// front, leaving it (and anything queued behind it) for the idle loop.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager, used to reclaim the zombies' address-space resources.
+    ///
+    /// # Returns
+    ///
+    /// The number of thread slots that were reclaimed, counting both process zombies and
+    /// deferred detached-thread zombies.
+    ///
+    fn reap_pending_zombies(&mut self, mm: &mut VirtMemoryManager) -> usize {
+        let mut reaped: usize = 0;
+        loop {
+            // Never reap the process manager daemon (PROCD) here; leave it queued so the idle loop can detect its
+            // termination and shut the kernel down.
+            if let Some(zombie) = self.zombies.front() {
+                if zombie.state().pid() == ProcessIdentifier::PROCD {
+                    break;
+                }
+            }
+            match self.harvest_zombies(mm) {
+                Ok(Some(_termination)) => reaped += 1,
+                Ok(None) => break,
+                Err(e) => {
+                    error!("failed to harvest zombies during admission: {:?}", e);
+                    break;
+                },
+            }
+        }
+        // Thread slots may also be held by detached-thread zombies whose cleanup was deferred
+        // because their `ContextInformation` was still needed by an in-progress context switch.
+        // Drain them on demand as well so that admission is retried instead of spuriously failing.
+        reaped += self.reap_deferred_zombie_threads(mm);
+        reaped
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Drains the queue of deferred detached-thread zombies, reclaiming each one's kernel and user
+    /// stacks, unmapping its user-stack pages, and notifying the thread manager. This mirrors
+    /// [`Self::harvest_zombie_thread`] but operates through `&mut self` and the supplied memory
+    /// manager so that it can be invoked from the on-demand reap path
+    /// ([`Self::reap_pending_zombies`]) rather than only at PM entry points.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager, used to reclaim the zombies' address-space resources.
+    ///
+    /// # Returns
+    ///
+    /// The number of deferred detached-thread zombies that were reaped.
+    ///
+    fn reap_deferred_zombie_threads(&mut self, mm: &mut VirtMemoryManager) -> usize {
+        let deferred: Vec<(ProcessIdentifier, ZombieThread)> =
+            core::mem::take(&mut self.deferred_reap);
+        let mut reaped: usize = 0;
+        for (pid, zombie_thread) in deferred {
+            // If the zombie has no user stack (kernel-only thread), the kernel stack is reclaimed
+            // via KernelStack::Drop and no page unmapping is needed.
+            if let (Some(_kernel_stack), Some(user_stack)) = zombie_thread.harvest() {
+                // Resolve the process vmem once before the page-unmapping loop below.
+                match self.find_process_mut(pid) {
+                    Ok(mut process_ref) => {
+                        let vmem: &mut Vmem = process_ref.state_mut().vmem_mut();
+                        // Traverse pages belonging to user stack.
+                        let base: usize = user_stack.base().into_raw_value();
+                        let top: usize = user_stack.top().into_raw_value();
+                        // TODO: Use an iterator for this.
+                        for raw_addr in (base..top).step_by(PAGE_SIZE) {
+                            let vaddr: PageAligned<VirtualAddress> =
+                                match PageAligned::from_raw_value(raw_addr) {
+                                    Ok(vaddr) => vaddr,
+                                    Err(_) => {
+                                        // SAFETY: the following condition is unreachable, because
+                                        // pages in the user stack are always page-aligned.
+                                        unreachable!("address conversion should succeed")
+                                    },
+                                };
+                            // Attempt to unmap page.
+                            match mm.try_unmap_upage(vmem, vaddr) {
+                                Ok(true) => {
+                                    // Page was present and has been successfully unmapped.
+                                },
+                                Ok(false) => {
+                                    // Page was never mapped (not demand-paged). Skip silently.
+                                },
+                                Err(error) => {
+                                    // Unexpected failure — log but continue since the address
+                                    // space will be reclaimed when it is destroyed.
+                                    warn!(
+                                        "failed to unmap page (vaddr={:?}, error={:?})",
+                                        vaddr, error
+                                    );
+                                },
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        // Unexpected failure — log but continue since the address space will be
+                        // reclaimed when it is destroyed.
+                        error!("failed to find process (pid={pid:?}, error={error:?})");
+                    },
+                }
+
+                // Frames allocated to the user stack are freed when we exit this scope.
+                // Frames allocated to the kernel stack are freed when we exit this scope.
+            }
+
+            // Notify the thread manager that this thread has been reaped.
+            self.tm.on_thread_reaped();
+            reaped += 1;
+        }
+        reaped
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Reserves the next thread identifier, reaping pending zombies on demand and retrying once if
+    /// the system-wide thread cap has been reached. This makes thread admission self-healing: a
+    /// terminate-heavy workload that has not yet quiesced is not spuriously refused while
+    /// reclaimable thread slots are merely awaiting harvest. See [`Self::reap_pending_zombies`].
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager, used to reclaim the zombies' address-space resources.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, the reserved thread identifier together with the next thread identifier to
+    /// commit. Otherwise, an error is returned.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the system-wide thread capacity remains exhausted after
+    /// reclaiming pending zombies, or if the thread identifier would overflow.
+    ///
+    fn try_next_tid_reaping(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+    ) -> Result<(ThreadIdentifier, ThreadIdentifier), Error> {
+        match self.tm.try_next_tid() {
+            Ok(ids) => Ok(ids),
+            Err(e) if e.code == ErrorCode::OutOfMemory => {
+                // The thread cap may be held purely by terminated-but-unharvested zombies. Reap
+                // them on demand and retry admission exactly once; if nothing was reclaimable,
+                // surface the original error unchanged.
+                if self.reap_pending_zombies(mm) == 0 {
+                    error!("thread admission failed and no zombies were reclaimable: {:?}", e);
+                    return Err(e);
+                }
+                self.tm.try_next_tid()
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Harvests the oldest zombie process and reclaims the resources owned by all of its threads.
+    /// Lifecycle records are not produced here because they commit when the corresponding zombie
+    /// transitions are created.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager used to reclaim user-stack and address-space pages.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(termination))` if a zombie process was harvested, or `Ok(None)` if no zombie process
+    /// is pending.
+    ///
+    /// # Errors
+    ///
+    /// This function currently logs resource-reclamation failures and does not return an error.
+    ///
+    pub(crate) fn harvest_zombies(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+    ) -> Result<Option<HarvestedProcess>, Error> {
+        let (mut zombie_threads, mut state, status): (
+            VecDeque<ZombieThread>,
+            Box<ProcessState>,
+            ExitStatus,
+        ) = match self.pop_zombie_process() {
+            Some((zombie_threads, state, status)) => (zombie_threads, state, status),
+            None => return Ok(None),
+        };
+
+        // Traverse the list of zombie threads.
+        while let Some(zombie_thread) = zombie_threads.pop_front() {
+            // Harvest zombie thread.
+            if let (Some(_kernel_stack), Some(user_stack)) = zombie_thread.harvest() {
+                // Traverse pages belonging to user stack.
+                let base: usize = user_stack.base().into_raw_value();
+                let top: usize = user_stack.top().into_raw_value();
+                // TODO: Use an iterator for this.
+                for raw_addr in (base..top).step_by(PAGE_SIZE) {
+                    let vaddr: PageAligned<VirtualAddress> =
+                        match PageAligned::from_raw_value(raw_addr) {
+                            Ok(vaddr) => vaddr,
+                            Err(_) => {
+                                // SAFETY: the following condition is unreachable, because
+                                // pages in the user stack are always page-aligned.
+                                unreachable!("address conversion should succeed")
+                            },
+                        };
+                    // Attempt to unmap page.
+                    match mm.try_unmap_upage(state.vmem_mut(), vaddr) {
+                        Ok(true) => {
+                            // Page was present and has been successfully unmapped.
+                        },
+                        Ok(false) => {
+                            // Page was never mapped (not demand-paged). Skip silently.
+                        },
+                        Err(error) => {
+                            // Unexpected failure — log but continue since the
+                            // address space will be reclaimed when it is destroyed.
+                            warn!("failed to unmap page (vaddr={:?}, error={:?})", vaddr, error);
+                        },
+                    }
+                }
+
+                // Frames allocated to the user stack are freed when we exit this scope.
+                // Frames allocated to the kernel stack are freed when we exit this scope.
+            }
+
+            // Notify the thread manager that this thread has been reaped.
+            self.tm.on_thread_reaped();
+        }
+
+        // Reclaim all remaining user frames of the dying process (code, data, heap, mmap, and any
+        // stack pages not unmapped above). Dropping `state` frees only the address space's
+        // page-table structures, not the user frames their entries map, so without this the
+        // process's resident frames would leak on exit.
+        if let Err(error) = state.vmem_mut().clear_user_space() {
+            warn!(
+                "harvest_zombies(): failed to reclaim user address space (pid={:?}, error={:?})",
+                state.pid(),
+                error
+            );
+        }
+
+        // Preserve termination metadata for shutdown detection and diagnostics. The lifecycle
+        // record was already committed when this process first transitioned to zombie state.
+        let pid: ProcessIdentifier = state.pid();
+        let parent: ProcessIdentifier = state.ppid();
+        let role: ProcessRole = self.classify_role(pid, parent);
+        let info: ProcessTerminationInfo = ProcessTerminationInfo::new(pid, status, parent, role);
+        Ok(Some(HarvestedProcess::new(info)))
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Maps one or more pages into the address space of a process.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager.
+    /// - `pid`: Process identifier.
+    /// - `vaddr`: Page-aligned base virtual address to map.
+    /// - `npages`: Number of pages to map.
+    /// - `access`: Access permissions for the mapped pages.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, `Ok(())` is returned. Otherwise, an error is returned instead.
+    ///
+    pub fn mmap(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        pid: ProcessIdentifier,
+        vaddr: PageAligned<VirtualAddress>,
+        npages: usize,
+        access: AccessPermission,
+    ) -> Result<(), Error> {
+        /// Maximum number of pages to allocate per batch. Caps the Vec allocation on the kheap.
+        const MMAP_BATCH_SIZE: usize = 16;
+
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let vmem: &mut Vmem = process.state_mut().vmem_mut();
+        let mut current_vaddr: PageAligned<VirtualAddress> = vaddr;
+        let mut remaining: usize = npages;
+
+        while remaining > 0 {
+            let count: usize = remaining.min(MMAP_BATCH_SIZE);
+            let mut uframes = Vec::new();
+            let batch: usize = if uframes.try_reserve(count).is_ok() {
+                count
+            } else if uframes.try_reserve(1).is_ok() {
+                // Batch allocation failed; fall back to single-page allocation.
+                1
+            } else {
+                let reason: &str = "kheap: cannot allocate uframes vec for mmap";
+                error!("{reason}");
+                Self::rollback_mmap(mm, vmem, vaddr, current_vaddr);
+                return Err(Error::new(ErrorCode::OutOfMemory, reason));
+            };
+            if let Err(e) = mm.alloc_upages(vmem, current_vaddr, access, true, batch, &mut uframes)
+            {
+                Self::rollback_mmap(mm, vmem, vaddr, current_vaddr);
+                return Err(e);
+            }
+            current_vaddr =
+                PageAligned::from_raw_value(current_vaddr.into_raw_value() + batch * PAGE_SIZE)?;
+            remaining -= batch;
+        }
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Rolls back a partial `mmap` by unmapping all pages in the range
+    /// `[base_vaddr, failed_vaddr)`. Best-effort: individual unmap failures are logged
+    /// but do not prevent the remaining pages from being cleaned up.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager.
+    /// - `vmem`: Virtual memory space containing the mappings.
+    /// - `base_vaddr`: Starting virtual address of the region to roll back.
+    /// - `failed_vaddr`: Virtual address where the allocation failed (exclusive upper bound).
+    ///
+    fn rollback_mmap(
+        mm: &mut VirtMemoryManager,
+        vmem: &mut Vmem,
+        base_vaddr: PageAligned<VirtualAddress>,
+        failed_vaddr: PageAligned<VirtualAddress>,
+    ) {
+        let mut raw: usize = base_vaddr.into_raw_value();
+        let end: usize = failed_vaddr.into_raw_value();
+        while raw < end {
+            match PageAligned::from_raw_value(raw) {
+                Ok(addr) => {
+                    if let Err(e) = mm.try_unmap_upage(vmem, addr) {
+                        warn!("mmap rollback: failed to unmap page (vaddr={raw:#x}, error={e:?})");
+                    }
+                },
+                Err(_) => {
+                    warn!("mmap rollback: invalid page address (vaddr={raw:#x})");
+                },
+            }
+            raw += PAGE_SIZE;
+        }
+    }
+
+    pub fn munmap(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        pid: ProcessIdentifier,
+        vaddr: PageAligned<VirtualAddress>,
+    ) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let vmem: &mut Vmem = process.state_mut().vmem_mut();
+        if mm.try_unmap_upage(vmem, vaddr)? {
+            Ok(())
+        } else {
+            let reason: &str = "page is not mapped";
+            error!("munmap(): {reason} (pid={pid:?}, vaddr={vaddr:?})");
+            Err(Error::new(ErrorCode::NoSuchEntry, reason))
+        }
+    }
+
+    pub fn mctrl(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        pid: ProcessIdentifier,
+        vaddr: PageAligned<VirtualAddress>,
+        access: AccessPermission,
+    ) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let vmem: &mut Vmem = process.state_mut().vmem_mut();
+        mm.ctrl_upage(vmem, vaddr, access)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Attaches a memory-mapped I/O region to a process. Before the region is attached, the access
+    /// permissions of the region are applied to every page in it.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process to which to attach the region.
+    /// - `region`: Memory-mapped I/O region to attach.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, empty is returned. Upon failure, an error is returned instead.
+    ///
+    pub fn mmio_alloc(
+        &mut self,
+        pid: ProcessIdentifier,
+        region: IoMemoryRegion,
+    ) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let state: &mut ProcessState = process.state_mut();
+
+        // Map all pages in the MMIO region.
+        let vmem: &mut Vmem = state.vmem_mut();
+        // An MMIO region starts at a page-aligned address and spans a whole number of pages that
+        // lie within the virtual address space. Check this once, before modifying any state, so
+        // that walking the pages of the region below cannot fail.
+        let pages: PageRange = PageRange::new(region.base(), region.size())?;
+        let perm: AccessPermission = region.perm();
+
+        if cfg!(feature = "nightly-performance-optimizations") {
+            // Single pass: apply permission changes directly.
+            for vaddr in pages {
+                vmem.kctrl(vaddr, perm, false)?;
+            }
+        } else {
+            // Two-pass: validate that every page can be mapped before modifying any state.
+            for vaddr in pages.clone() {
+                vmem.kctrl(vaddr, perm, true)?;
+            }
+
+            // All validations passed — apply the permission changes for real.
+            for vaddr in pages {
+                vmem.kctrl(vaddr, perm, false)?;
+            }
+        }
+
+        state.add_mmio(region);
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Detaches a memory-mapped I/O region identified by `tag` from the process.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process from which to detach the region.
+    /// - `tag`: Tag that uniquely identifies the MMIO region to detach.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, empty is returned. Upon failure, an error is returned instead.
+    ///
+    pub fn mmio_free(&mut self, pid: ProcessIdentifier, tag: MmioTag) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        let state: &mut ProcessState = process.state_mut();
+        state.remove_mmio(tag);
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Retrieves metadata for the MMIO region identified by `tag` attached to a process.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Identifier of the process that owns the region.
+    /// - `tag`: Tag that uniquely identifies the MMIO region.
+    ///
+    /// # Returns
+    ///
+    /// Upon success, a tuple containing the base address, size, and access permissions of the
+    /// region is returned. Upon failure, an error is returned instead.
+    ///
+    pub fn mmio_info(
+        &self,
+        pid: ProcessIdentifier,
+        tag: MmioTag,
+    ) -> Result<(PageAligned<VirtualAddress>, usize, AccessPermission), Error> {
+        let process: ProcessRef = self.find_process(pid)?;
+        let state: &ProcessState = process.state();
+
+        match state.mmio_info(tag) {
+            Some(region) => Ok((region.base(), region.size(), region.perm())),
+            None => {
+                let reason: &'static str = "mmio region not found";
+                error!("{reason}");
+                Err(Error::new(ErrorCode::NoSuchEntry, reason))
+            },
+        }
+    }
+
+    pub fn attach_pmio(&mut self, pid: ProcessIdentifier, port: AnyIoPort) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        process.state_mut().add_pmio(port);
+        Ok(())
+    }
+
+    pub fn detach_pmio(
+        &mut self,
+        pid: ProcessIdentifier,
+        port_number: u16,
+    ) -> Result<AnyIoPort, Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        process.state_mut().remove_pmio(port_number)
+    }
+
+    pub fn read_pmio(
+        &mut self,
+        pid: ProcessIdentifier,
+        port_number: u16,
+        port_width: IoPortWidth,
+    ) -> Result<u32, Error> {
+        let process: ProcessRef = self.find_process(pid)?;
+        process.state().read_pmio(port_number, port_width)
+    }
+
+    pub fn write_pmio(
+        &mut self,
+        pid: ProcessIdentifier,
+        port_number: u16,
+        port_width: IoPortWidth,
+        value: u32,
+    ) -> Result<(), Error> {
+        let mut process: ProcessRefMut = self.find_process_mut(pid)?;
+        process
+            .state_mut()
+            .write_pmio(port_number, port_width, value)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Posts a message.
+    ///
+    /// # Parameters
+    ///
+    /// - `receiver`: ID of the receiver.
+    /// - `message`: Message to send.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, empty is returned. Otherwise, an error code is returned instead.
+    ///
+    pub fn post_message(
+        &mut self,
+        receiver: MessageReceiver,
+        message: Message,
+    ) -> Result<(), Error> {
+        // Validate the destination before allocating a sequence number, so that a rejected send
+        // does not consume one. The destination is resolved again afterwards because the broker
+        // and the process list cannot be borrowed mutably at the same time; nothing in between can
+        // invalidate the receiver.
+        {
+            let mut process: ProcessRefMut = self.find_receiver_mut(receiver)?;
+            if matches!(&process, ProcessRefMut::Zombie(_)) {
+                let reason: &str = "cannot post a message to a zombie process";
+                warn!("{reason} (receiver={receiver:?})");
+                return Err(Error::new(ErrorCode::NoSuchEntry, reason));
+            }
+            if !receiver.tid.is_none()
+                && matches!(process.find_thread_mut(receiver.tid), Some(ThreadRefMut::Zombie(_)))
+            {
+                let reason: &str = "cannot post a message to a zombie thread";
+                warn!("{reason} (receiver={receiver:?})");
+                return Err(Error::new(ErrorCode::NoSuchEntry, reason));
+            }
+        }
+
+        let sequence: DeliverySequence = self.delivery.allocate_sequence();
+        self.find_receiver_mut(receiver)?
+            .state_mut()
+            .post_message(sequence, message);
+
+        self.note_message_posted()?;
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Resolves the process that owns the mailbox addressed by a receiver.
+    ///
+    /// # Parameters
+    ///
+    /// - `receiver`: Receiver whose owning process is resolved.
+    ///
+    /// # Returns
+    ///
+    /// Upon successful completion, a mutable reference to the owning process is returned. Otherwise,
+    /// an error is returned instead.
+    ///
+    fn find_receiver_mut(&mut self, receiver: MessageReceiver) -> Result<ProcessRefMut<'_>, Error> {
+        if receiver.tid.is_none() {
+            self.find_process_mut(receiver.pid)
+        } else {
+            self.find_process_by_tid(receiver.tid)
+        }
+    }
+
+    pub fn add_event(&mut self, ownership: EventOwnership) -> Result<(), Error> {
+        self.get_running_mut().state_mut().add_event(ownership);
+
+        Ok(())
+    }
+
+    pub fn remove_event(&mut self, ev: &Event) -> Result<(), Error> {
+        self.get_running_mut().state_mut().remove_event(ev);
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Handles a page fault that may be caused by user-space stack growth.
+    /// If the faulting address falls within the user stack region and the page is not present,
+    /// a new page is demand-allocated and mapped.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager.
+    /// - `fault_addr`: Faulting virtual address.
+    /// - `error_code`: Typed x86 page-fault error code.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the fault was resolved by mapping a new stack page.
+    /// - `Ok(false)` if the fault address is not within the user stack region or the fault is not
+    ///   a page-not-present fault from user mode.
+    /// - `Err(...)` if page allocation failed.
+    ///
+    pub fn handle_stack_page_fault(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        fault_addr: usize,
+        error_code: excp::ErrorCode,
+    ) -> Result<bool, Error> {
+        // Only handle page-not-present faults from user mode.
+        if error_code.is_present() || !error_code.is_user() {
+            return Ok(false);
+        }
+
+        self.grow_user_stack(mm, fault_addr)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Demand-allocates the page of the running process's main-thread user stack that contains
+    /// `addr`. This is the stack-growth policy shared by user stack page faults and signal-frame
+    /// construction: any page of the stack region may be allocated on demand, and nothing outside it.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager.
+    /// - `addr`: Address within the page to allocate, which must not be mapped yet.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if a new stack page was mapped.
+    /// - `Ok(false)` if `addr` is not within the user stack region.
+    /// - `Err(...)` if page allocation failed.
+    ///
+    fn grow_user_stack(&mut self, mm: &mut VirtMemoryManager, addr: usize) -> Result<bool, Error> {
+        // Check if the address falls within the main-thread user stack region.
+        // The stack occupies [USER_STACK_TOP_RAW, USER_STACK_TOP_RAW + USER_STACK_SIZE).
+        const STACK_REGION_START: usize = USER_STACK_TOP_RAW;
+        const STACK_REGION_END: usize = STACK_REGION_START + USER_STACK_SIZE;
+        if !(STACK_REGION_START..STACK_REGION_END).contains(&addr) {
+            return Ok(false);
+        }
+
+        // Page-align the address and map the page.
+        let page_addr: usize = addr & !(PAGE_SIZE - 1);
+        let vaddr: PageAligned<VirtualAddress> = PageAligned::from_raw_value(page_addr)?;
+        let pid: ProcessIdentifier = self.get_pid();
+        debug!("demand-paging stack page (pid={pid:?}, vaddr={vaddr:?})");
+        self.mmap(mm, pid, vaddr, 1, AccessPermission::RDWR)?;
+
+        Ok(true)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Handles a page fault that may be caused by a copy-on-write mapping in the
+    /// running process's address space.
+    ///
+    /// # Parameters
+    ///
+    /// - `mm`: Virtual memory manager.
+    /// - `fault_addr`: Faulting virtual address.
+    /// - `error_code`: Typed x86 page-fault error code.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the fault was resolved as a copy-on-write fault.
+    /// - `Ok(false)` if the fault is not a copy-on-write fault.
+    /// - `Err(...)` if resolving the fault failed.
+    ///
+    pub fn handle_cow_page_fault(
+        &mut self,
+        mm: &mut VirtMemoryManager,
+        fault_addr: usize,
+        error_code: excp::ErrorCode,
+    ) -> Result<bool, Error> {
+        let vmem: &mut Vmem = self.get_running_mut().state_mut().vmem_mut();
+        mm.try_resolve_cow_fault(vmem, fault_addr, error_code)
+    }
+}

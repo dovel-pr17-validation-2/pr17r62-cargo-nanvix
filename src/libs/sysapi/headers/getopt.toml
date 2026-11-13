@@ -1,0 +1,70 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for getopt.h.
+# The gen-headers tool combines this with the extern "C" signatures parsed
+# from the syscall crate sources to produce include/getopt.h.
+
+file = "getopt.h"
+brief = "Command-line option parsing (GNU long options)."
+description = '''
+Declares the GNU long-option extensions to getopt(). The base getopt()
+interface and the optarg/optind/opterr/optopt globals are declared in
+<unistd.h>, which this header includes.'''
+includes = ["unistd.h"]
+guard = "_NANVIX_GETOPT_H"
+scan_crates = ["syscall"]
+content_order = [
+    "rust_types:long_option",
+    "rust_constants:has_arg",
+    "section:0",
+]
+
+[[rust_types]]
+path = "getopt::option"
+style = "tag"
+group = "long_option"
+section_title = "Long Option Type"
+c_declaration = '''
+/** @brief Describes one long option for getopt_long(). */
+struct option {
+    const char *name; /**< Long option name, without the leading "--". */
+    int has_arg;      /**< One of no_argument, required_argument, optional_argument. */
+    int *flag;        /**< If non-null, *flag is set to val and 0 is returned. */
+    int val;          /**< Value to return (or store through flag) when matched. */
+};'''
+
+[[rust_constants]]
+path = "getopt::NO_ARGUMENT"
+c_name = "no_argument"
+group = "has_arg"
+section_title = "Long Option has_arg Values"
+c_declaration = '''
+#define no_argument       0
+#define required_argument 1
+#define optional_argument 2'''
+no_comment = true
+
+[[rust_constants]]
+path = "getopt::REQUIRED_ARGUMENT"
+c_name = "required_argument"
+group = "has_arg"
+emit = false
+
+[[rust_constants]]
+path = "getopt::OPTIONAL_ARGUMENT"
+c_name = "optional_argument"
+group = "has_arg"
+emit = false
+
+[[sections]]
+title = "Long Option Functions"
+functions = ["getopt_long", "getopt_long_only"]
+
+[overrides]
+getopt_long = '''
+extern int getopt_long(int argc, char *const argv[], const char *optstring,
+                       const struct option *longopts, int *longindex);'''
+getopt_long_only = '''
+extern int getopt_long_only(int argc, char *const argv[], const char *optstring,
+                            const struct option *longopts, int *longindex);'''

@@ -1,0 +1,50 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for sys/wait.h.
+
+file = "sys/wait.h"
+brief = "Process-termination wait interface."
+description = '''
+'''
+includes = ["sys/types.h"]
+guard = "_NANVIX_SYS_WAIT_H"
+scan_crates = ["syscall"]
+content_order = ["rust_constants:options", "raw:0", "section:0"]
+rust_constant_docs = false
+
+[[rust_constants]]
+path = "sys_wait::WNOHANG"
+group = "options"
+section_title = "Options"
+
+[[rust_constants]]
+path = "sys_wait::WUNTRACED"
+group = "options"
+
+[[rust_constants]]
+path = "sys_wait::WCOREFLAG"
+emit = false
+
+[[raw_sections]]
+title = "Status-decoding macros"
+text = '''
+#define WIFEXITED(status) (((status) & 0x7f) == 0)
+#define WEXITSTATUS(status) (((status) >> 8) & 0xff)
+#define WIFSIGNALED(status) (((status) & 0x7f) != 0 && ((status) & 0x7f) != 0x7f)
+#define WTERMSIG(status) ((status) & 0x7f)
+#define WIFSTOPPED(status) (((status) & 0xff) == 0x7f)
+#define WSTOPSIG(status) WEXITSTATUS(status)
+/* Non-standard but widely used (glibc/BSD): reports whether the child produced
+ * a core dump. Nanvix never sets the core-dump bit, so WCOREDUMP() is always
+ * false, but the macro lets portable software referencing it compile. */
+#define WCOREFLAG 0x80
+#define WCOREDUMP(status) ((status) & WCOREFLAG)'''
+
+[[sections]]
+title = "Functions"
+functions = ["waitpid", "wait"]
+
+[overrides]
+wait = '''
+extern pid_t wait(int *status);'''

@@ -1,0 +1,44 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+[package]
+name = "nanvix-test"
+version.workspace = true
+license-file.workspace = true
+edition = "2024"
+authors.workspace = true
+description = "Test Utility for Nanvix"
+homepage.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+nanvixd = { workspace = true, default-features = false }
+nanvix = { workspace = true, features = ["internal-api"] }
+no_fail = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+shell-words = { workspace = true }
+globset = { workspace = true }
+koptions = { workspace = true, features = ["std"] }
+# Control-plane HTTP client used by the test harness (cross-platform: the HTTP
+# executor now runs on Windows too, driving nanvixd in standalone HTTP mode).
+reqwest = { workspace = true, features = ["json"] }
+user-vm-api = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+cmdline = { workspace = true, features = ["std"] }
+
+[features]
+default = ["microvm"]
+microvm = ["nanvix/microvm", "nanvixd/microvm"]
+whp = ["nanvix/whp", "nanvixd/whp"]
+
+[lints]
+workspace = true

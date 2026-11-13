@@ -1,0 +1,272 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for netdb.h.
+
+file = "netdb.h"
+brief = "Network database operations."
+description = '''
+The structure layouts mirror the Rust definitions in the sysapi crate
+(netdb.rs).'''
+includes = ["netinet/in.h", "sys/socket.h"]
+guard = "_NANVIX_NETDB_H"
+content_order = [
+    "rust_types:structures",
+    "rust_constants:flags_and_error_codes",
+    "raw:0",
+]
+
+[[rust_types]]
+path = "netdb::hostent"
+group = "structures"
+section_title = "Structures"
+c_only_reason = "h_addr is a C member alias for h_addr_list[0]."
+c_declaration = '''
+/** @brief Host database entry. */
+struct hostent {
+    char *h_name;        /**< Official host name.        */
+    char **h_aliases;    /**< Alias list.                */
+    int h_addrtype;      /**< Host address type.         */
+    int h_length;        /**< Length of address.         */
+    char **h_addr_list;  /**< List of addresses.         */
+};
+#define h_addr h_addr_list[0]'''
+
+[[rust_types]]
+path = "netdb::servent"
+group = "structures"
+c_declaration = '''
+/** @brief Service database entry. */
+struct servent {
+    char *s_name;     /**< Official service name. */
+    char **s_aliases; /**< Alias list.            */
+    int s_port;       /**< Port number.           */
+    char *s_proto;    /**< Protocol to use.       */
+};'''
+
+[[rust_types]]
+path = "netdb::protoent"
+group = "structures"
+c_declaration = '''
+/** @brief Protocol database entry. */
+struct protoent {
+    char *p_name;     /**< Official protocol name. */
+    char **p_aliases; /**< Alias list.             */
+    int p_proto;      /**< Protocol number.        */
+};'''
+
+[[rust_types]]
+path = "netdb::addrinfo"
+group = "structures"
+c_declaration = '''
+/** @brief Address information. */
+struct addrinfo {
+    int ai_flags;             /**< Input flags.                 */
+    int ai_family;            /**< Address family.              */
+    int ai_socktype;          /**< Socket type.                 */
+    int ai_protocol;          /**< Protocol.                    */
+    socklen_t ai_addrlen;     /**< Length of ai_addr.           */
+    char *ai_canonname;       /**< Canonical name for the host. */
+    struct sockaddr *ai_addr; /**< Socket address.              */
+    struct addrinfo *ai_next; /**< Next structure in the list.  */
+};'''
+
+[[rust_constants]]
+path = "netdb::AI_PASSIVE"
+group = "flags_and_error_codes"
+section_title = "Flags and error codes"
+c_declaration = '''
+#define AI_PASSIVE 0x0001
+#define AI_CANONNAME 0x0002
+#define AI_NUMERICHOST 0x0004
+#define AI_NUMERICSERV 0x0008
+#define AI_V4MAPPED 0x0800
+#define AI_ALL 0x0100
+#define AI_ADDRCONFIG 0x0400
+
+#define NI_NUMERICHOST 0x0001
+#define NI_NUMERICSERV 0x0002
+#define NI_NOFQDN 0x0004
+#define NI_NAMEREQD 0x0008
+#define NI_DGRAM 0x0010
+#define NI_MAXHOST 1025
+#define NI_MAXSERV 32
+
+#define EAI_BADFLAGS (-1)
+#define EAI_NONAME (-2)
+#define EAI_AGAIN (-3)
+#define EAI_FAIL (-4)
+#define EAI_FAMILY (-6)
+#define EAI_SOCKTYPE (-7)
+#define EAI_SERVICE (-8)
+#define EAI_MEMORY (-10)
+#define EAI_SYSTEM (-11)
+#define EAI_OVERFLOW (-12)
+
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN 2
+#define NO_RECOVERY 3
+#define NO_DATA 4
+#define NO_ADDRESS NO_DATA'''
+no_comment = true
+
+[[rust_constants]]
+path = "netdb::AI_CANONNAME"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::AI_NUMERICHOST"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::AI_NUMERICSERV"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::AI_V4MAPPED"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::AI_ALL"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::AI_ADDRCONFIG"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_NUMERICHOST"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_NUMERICSERV"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_NOFQDN"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_NAMEREQD"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_DGRAM"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_MAXHOST"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NI_MAXSERV"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_BADFLAGS"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_NONAME"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_AGAIN"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_FAIL"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_FAMILY"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_SOCKTYPE"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_SERVICE"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_MEMORY"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_SYSTEM"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::EAI_OVERFLOW"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::HOST_NOT_FOUND"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::TRY_AGAIN"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NO_RECOVERY"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NO_DATA"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NO_ADDRESS"
+group = "flags_and_error_codes"
+emit = false
+
+[[rust_constants]]
+path = "netdb::NO_DATA"
+emit = false
+
+[[raw_sections]]
+title = "Functions"
+text = '''
+extern int getaddrinfo(
+    const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
+extern void freeaddrinfo(struct addrinfo *res);
+extern const char *gai_strerror(int errcode);
+extern int getnameinfo(
+    const struct sockaddr *sa, socklen_t salen, char *host, socklen_t hostlen, char *serv,
+    socklen_t servlen, int flags);
+extern struct hostent *gethostbyname(const char *name);
+extern struct servent *getservbyname(const char *name, const char *proto);
+extern const char *hstrerror(int err);
+
+/** @brief Error code set by the legacy host-lookup functions. */
+extern int h_errno;'''

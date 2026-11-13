@@ -1,0 +1,227 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for stdlib.h.
+# The gen-headers tool combines this with the extern "C" signatures parsed
+# from this crate's sources to produce include/stdlib.h.
+
+file = "stdlib.h"
+brief = "General utilities."
+description = """
+Declares memory allocation, string conversion, integer arithmetic, searching
+and sorting, pseudo-random sequence generation, environment, and process
+control interfaces implemented by the libc_stdlib Rust crate."""
+includes = ["stddef.h", "sys/wait.h", "locale.h"]
+guard = "_NANVIX_STDLIB_H"
+content_order = [
+    "rust_constants",
+    "rust_types",
+    "section:0",
+    "section:1",
+    "section:2",
+    "section:3",
+    "section:4",
+    "section:5",
+    "section:6",
+    "section:7",
+    "section:8",
+    "section:9",
+    "section:10",
+]
+
+[[rust_constants]]
+path = "EXIT_SUCCESS"
+c_value = "0"
+comment = "Successful termination for exit()."
+guard = "EXIT_SUCCESS"
+
+[[rust_constants]]
+path = "EXIT_FAILURE"
+c_value = "1"
+comment = "Unsuccessful termination for exit()."
+guard = "EXIT_FAILURE"
+
+[[rust_constants]]
+path = "RAND_MAX"
+c_value = "2147483647"
+comment = "Maximum value returned by rand()."
+guard = "RAND_MAX"
+
+[[rust_constants]]
+path = "MB_CUR_MAX"
+c_value = "((size_t)1)"
+comment = "Maximum number of bytes in a character for the current locale."
+guard = "MB_CUR_MAX"
+
+[[rust_types]]
+path = "div_t"
+c_declaration = """
+/* glibc compatibility: expose alloca() via <stdlib.h> under _GNU_SOURCE. */
+#ifdef _GNU_SOURCE
+#include <alloca.h>
+#endif
+
+/** @brief Structure type returned by the div() function. */
+typedef struct {
+    int quot; /**< Quotient.  */
+    int rem;  /**< Remainder. */
+} div_t;
+
+/** @brief Structure type returned by the ldiv() function. */
+typedef struct {
+    long quot; /**< Quotient.  */
+    long rem;  /**< Remainder. */
+} ldiv_t;
+
+/** @brief Structure type returned by the lldiv() function. */
+typedef struct {
+    long long quot; /**< Quotient.  */
+    long long rem;  /**< Remainder. */
+} lldiv_t;"""
+
+[[rust_types]]
+path = "ldiv_t"
+emit = false
+
+[[rust_types]]
+path = "lldiv_t"
+emit = false
+
+[[sections]]
+title = "Memory Allocation"
+functions = [
+    "malloc",
+    "free",
+    "calloc",
+    "realloc",
+    "reallocarray",
+    "aligned_alloc",
+    "posix_memalign",
+]
+
+[[sections]]
+title = "String Conversion"
+functions = [
+    "atof",
+    "atoi",
+    "atol",
+    "atoll",
+    "strtod",
+    "strtof",
+    "strtold",
+    "strtol",
+    "strtoll",
+    "strtoul",
+    "strtoull",
+    "strtod_l",
+    "strtof_l",
+    "strtold_l",
+    "strtol_l",
+    "strtoll_l",
+    "strtoul_l",
+    "strtoull_l",
+]
+
+[[sections]]
+title = "Integer Arithmetic"
+functions = ["abs", "labs", "llabs", "div", "ldiv", "lldiv"]
+
+[[sections]]
+title = "Searching and Sorting"
+functions = ["bsearch", "qsort", "qsort_r"]
+
+[[sections]]
+title = "Pseudo-Random Sequence Generation"
+functions = ["rand", "srand"]
+
+[[sections]]
+title = "Environment"
+functions = [
+    "getenv",
+    "secure_getenv",
+    "setenv",
+    "unsetenv",
+    "putenv",
+    "clearenv",
+]
+
+[[sections]]
+title = "Process Control"
+functions = [
+    "_Exit",
+    "abort",
+    "at_quick_exit",
+    "atexit",
+    "exit",
+    "quick_exit",
+    "system",
+]
+
+[[sections]]
+title = "Multibyte Conversion"
+functions = ["mblen", "mbtowc", "mbstowcs", "wctomb", "wcstombs"]
+
+[[sections]]
+title = "Temporary Files"
+functions = ["mkdtemp", "mkostemp", "mkstemp", "mktemp"]
+
+[[sections]]
+title = "Path Utilities"
+functions = ["realpath"]
+
+[[sections]]
+title = "Pseudo-Terminals"
+functions = ["posix_openpt", "grantpt", "unlockpt", "ptsname", "ptsname_r"]
+
+[overrides]
+_Exit = '''
+extern _Noreturn void _Exit(int status);'''
+abort = '''
+extern _Noreturn void abort(void);'''
+exit = '''
+extern _Noreturn void exit(int status);'''
+quick_exit = '''
+extern _Noreturn void quick_exit(int status);'''
+strtod = '''
+extern double strtod(const char *restrict nptr, char **restrict endptr);'''
+strtof = '''
+extern float strtof(const char *restrict nptr, char **restrict endptr);'''
+strtold = '''
+extern long double strtold(const char *restrict nptr, char **restrict endptr);'''
+strtol = '''
+extern long strtol(const char *restrict nptr, char **restrict endptr, int base);'''
+strtoll = '''
+extern long long strtoll(const char *restrict nptr, char **restrict endptr, int base);'''
+strtoul = '''
+extern unsigned long strtoul(const char *restrict nptr, char **restrict endptr, int base);'''
+strtoull = '''
+extern unsigned long long strtoull(const char *restrict nptr, char **restrict endptr, int base);'''
+strtod_l = "extern double strtod_l(const char *restrict nptr, char **restrict endptr, locale_t locale);"
+strtof_l = "extern float strtof_l(const char *restrict nptr, char **restrict endptr, locale_t locale);"
+strtold_l = "extern long double strtold_l(const char *restrict nptr, char **restrict endptr, locale_t locale);"
+strtol_l = "extern long strtol_l(const char *restrict nptr, char **restrict endptr, int base, locale_t locale);"
+strtoll_l = "extern long long strtoll_l(const char *restrict nptr, char **restrict endptr, int base, locale_t locale);"
+strtoul_l = "extern unsigned long strtoul_l(const char *restrict nptr, char **restrict endptr, int base, locale_t locale);"
+strtoull_l = "extern unsigned long long strtoull_l(const char *restrict nptr, char **restrict endptr, int base, locale_t locale);"
+qsort_r = '''
+extern void qsort_r(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *, void *), void *arg);'''
+mbtowc = '''
+extern int mbtowc(wchar_t *restrict pwc, const char *restrict s, size_t n);'''
+mblen = '''
+extern int mblen(const char *s, size_t n);'''
+wctomb = '''
+extern int wctomb(char *s, wchar_t wc);'''
+mbstowcs = '''
+extern size_t mbstowcs(wchar_t *restrict dst, const char *restrict src, size_t n);'''
+wcstombs = '''
+extern size_t wcstombs(char *restrict dst, const wchar_t *restrict src, size_t n);'''
+mkdtemp = '''
+extern char *mkdtemp(char *tmpl);'''
+mkstemp = '''
+extern int mkstemp(char *tmpl);'''
+mkostemp = '''
+extern int mkostemp(char *tmpl, int flag);'''
+mktemp = '''
+extern char *mktemp(char *tmpl);'''
+realpath = '''
+extern char *realpath(const char *restrict path, char *restrict resolved_path);'''

@@ -1,0 +1,133 @@
+---
+name: ci-cd-pipeline
+description: Guide for Nanvix CI and GitHub Actions workflow behavior, including local pipeline execution and matrix coverage. Use this when asked about CI checks, workflow failures, or release flow.
+---
+
+# CI/CD Pipeline
+
+Use this skill when the user asks about the continuous integration and deployment pipeline, GitHub
+Actions workflows, or automated quality checks.
+
+## Running the Full Pipeline Locally
+
+```bash
+./scripts/pipeline.sh
+```
+
+The pipeline runs all quality checks and tests across the supported configuration matrix.
+
+## Pipeline Steps
+
+The pipeline runs these steps in order:
+
+1. **Spell Check** — Checks spelling in source code.
+2. **Test Layout Check** — Verifies that tests live in their own files (`test-layout-check`).
+3. **Format Check** — Verifies code formatting.
+4. **Lint Check** — Runs Clippy and other linters.
+5. **Verify** — Runs Verus formal verification on annotated crates.
+6. **Build** — Compiles all targets.
+7. **Test** — Runs unit and system integration tests.
+
+## Configuration Matrix
+
+### Machine-Independent Steps
+
+- `spellcheck`, `test-layout` and `format` run once (not per-machine).
+
+### Machine-Dependent Steps
+
+`scripts/pipeline.sh` executes machine-dependent
+steps for `microvm`.
+
+| Machine       | Build Types    |
+|---------------|----------------|
+| `microvm`     | debug, release |
+
+## Individual Quality Checks
+
+```bash
+# Spell check.
+./z build -- spellcheck
+
+# Test layout check (tests must live in their own files, see doc/test.md).
+./z build -- test-layout-check
+
+# Format check.
+./z build -- format-check
+
+# Lint check.
+./z build -- lint-check
+
+# Formal verification.
+./z build -- verify
+
+# Unit tests.
+./z build -- run-unit-tests
+```
+
+## GitHub Actions Workflows
+
+Workflows are defined in `.github/workflows/`. They follow the same quality gates as the local
+pipeline, but matrix coverage is split across multiple jobs and run on pull requests and pushes to
+`dev`.
+
+Matrix coverage in GitHub Actions:
+
+- `checks`: format + spellcheck + test layout (single run).
+- `lint`, `verify`, `ci-build`: `microvm` in debug and release configurations.
+- `ci-test`: same matrix.
+
+Pull requests land on `dev` through a merge queue, which runs `ci.yml` again on `merge_group`
+events. The `dev` ruleset requires one check, `Required status check` (the `required-status-check`
+job), on pull requests and in the merge queue. It fails if any job that it needs fails or is
+cancelled, and in the merge queue the source check, lint, verify, build, and test jobs must also
+succeed. Add every new validation job to its `needs`, or the merge queue will not wait for it.
+
+The separate `Test Change Review` workflow (`test-change-review.yml`) runs on `pull_request_target`
+for pull requests to `dev`. It runs `scripts/flag-test-changes.py`, which labels the pull request
+`review::tests-modified` and keeps one sticky comment when an existing test is modified, removed or
+renamed, or when the test layout allowlist grows. It is advisory (it never fails the
+pull request) and never checks out or runs pull request code, so keep it that way when editing it:
+pass event values through `env`, not `${{ }}` in scripts. It takes effect only once merged to `dev`.
+
+Pull requests that only change documentation (Markdown files other than the root `README.md`, or
+files under `doc/`) skip the build, test, and benchmark jobs; source checks, lint, and verify still
+run. The root `README.md` does not count as documentation because it is copied into the guest root
+file system images that the integration tests read.
+
+> **Note:** The `ci-windows` workflow validates Windows host builds (nanvixd, UserVM, source checks)
+> and runs a smoke test using nanvixd in standalone interactive mode on WHP-enabled runners.
+
+## Release Process
+
+```bash
+# Create a release archive.
+./z build -- release
+
+# The archive name follows this pattern:
+# nanvix-<ver>-<target>-<machine>-standalone-<mode>-<log>-<memory>mb.tar.bz2
+```
+
+Releases can be created with:
+
+```bash
+# Patch release (X.Y.Z -> X.Y.(Z+1))
+python3 scripts/create-release.py --patch   # Linux / macOS
+python scripts/create-release.py --patch    # Windows
+
+# Minor release (X.Y.Z -> X.(Y+1).0)
+python3 scripts/create-release.py --minor   # Linux / macOS
+python scripts/create-release.py --minor    # Windows
+
+# Major release (X.Y.Z -> (X+1).0.0)
+python3 scripts/create-release.py --major   # Linux / macOS
+python scripts/create-release.py --major    # Windows
+```
+
+## Pipeline Output
+
+The pipeline tracks and reports:
+
+- Pass/fail/skip counts per step.
+- Total elapsed time.
+- Detailed error output for failed steps.

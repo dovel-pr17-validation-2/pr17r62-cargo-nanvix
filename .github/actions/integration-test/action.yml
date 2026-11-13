@@ -1,0 +1,71 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Integration Test"
+description: "Run a disjoint shard of the TOML-driven integration tests for the
+  microvm machine type"
+
+inputs:
+  build-type:
+    description: "Build type (debug or release)"
+    required: true
+  machine-type:
+    description: "Machine type"
+    required: true
+  shard-index:
+    description: "1-based index of this shard (e.g. 1)"
+    required: true
+  shard-total:
+    description: "Total number of shards the tests are partitioned into (e.g. 4)"
+    required: true
+  target:
+    description: "Target architecture (e.g. x86, x86_64)"
+    required: false
+    default: "x86"
+
+runs:
+  using: "composite"
+  steps:
+    # Run this shard's slice of the standalone integration suite directly from
+    # the downloaded artifacts. The harness selects a disjoint, round-robin
+    # subset via `-shard INDEX/TOTAL`, so new tests added to the TOML config are
+    # automatically distributed across shards with no workflow changes. The
+    # config path must be the last argument (the harness treats it positionally),
+    # so the `-shard` selector precedes it.
+    - name: "Integration Test (${{ inputs.machine-type }}, shard ${{ inputs.shard-index }}/${{ inputs.shard-total }})"
+      shell: bash
+      env:
+        RUST_LOG: info
+        # Forwarded to the harness so it can gate build-mode-restricted tests (e.g. heavy tests
+        # marked release-only via `build_modes`, which are too slow under a debug/trace build).
+        BUILD_MODE: ${{ inputs.build-type }}
+      run: |
+        set -Eeuo pipefail
+
+        SHARD="${{ inputs.shard-index }}/${{ inputs.shard-total }}"
+        echo "Running: ./bin/nanvix-test.elf -shard ${SHARD} test/test-standalone.toml"
+        ./bin/nanvix-test.elf -shard "${SHARD}" test/test-standalone.toml
+
+    # Ported POSIX C test suites. Standalone-only: the runner boots each suite
+    # under nanvixd in standalone mode and uses the guest exit code as the
+    # pass/fail signal. The SHARD selector partitions the suites round-robin so
+    # each runner executes a disjoint slice. This also exercises the freestanding
+    # guest C toolchain (build/make/guest-c-apps.mk) that no other CI step compiles.
+    - name: "POSIX C Suites (${{ inputs.machine-type }}, shard ${{ inputs.shard-index }}/${{ inputs.shard-total }})"
+      shell: bash
+      # No RUST_LOG here (unlike the direct-invocation step above): this step
+      # drives the harness through `./z build -- run-posix-tests`, whose recipe
+      # sets RUST_LOG=$(LOG_LEVEL) on the harness command line, so a step-level
+      # RUST_LOG would be overridden and have no effect.
+      run: |
+        set -Eeuo pipefail
+
+        RELEASE_FLAG=""
+        if [[ "${{ inputs.build-type }}" == "release" ]]; then
+          RELEASE_FLAG="--release"
+        fi
+
+        ./z build ${RELEASE_FLAG} -- run-posix-tests \
+            "MACHINE=${{ inputs.machine-type }}" \
+            TARGET=${{ inputs.target }} \
+            "SHARD=${{ inputs.shard-index }}/${{ inputs.shard-total }}"

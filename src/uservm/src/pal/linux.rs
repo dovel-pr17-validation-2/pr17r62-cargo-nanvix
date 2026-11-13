@@ -1,0 +1,617 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//! # Platform abstraction layer for Linux
+//!
+//! This module provides platform-specific functionalities for Linux-based systems.
+//!
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use ::anyhow::Result;
+use ::libc::{
+    c_char,
+    c_int,
+};
+use ::log::{
+    error,
+    trace,
+    warn,
+};
+use ::std::{
+    ffi::CString,
+    mem,
+    os::unix::io::RawFd,
+    ptr,
+    slice,
+};
+use ::sys::ipc::IkcFrame;
+use ::tokio::sync::mpsc::Sender;
+
+//==================================================================================================
+// Structures
+//==================================================================================================
+
+/// An anonymous memory mapping.
+#[derive(Debug)]
+pub struct AnonymousMapping {
+    /// Pointer to the memory location where the region is mapped.
+    ptr: *mut ::libc::c_void,
+    /// Size of the mapping (in bytes).
+    size: usize,
+}
+
+// SAFETY: The mapping is an isolated region of memory not shared with other threads.
+unsafe impl Send for AnonymousMapping {}
+// SAFETY: The &self accessors return borrowed slices tied to &self's lifetime.
+unsafe impl Sync for AnonymousMapping {}
+
+/// A memory-mapped file.
+#[derive(Debug)]
+pub struct FileMapping {
+    /// Underlying file descriptor.
+    fd: ::libc::c_int,
+    /// Pointer to the memory location where the file is mapped.
+    ptr: *mut ::libc::c_void,
+    /// Size of the mapping (in bytes).
+    size: usize,
+}
+
+//==================================================================================================
+// Implementations
+//==================================================================================================
+
+impl AnonymousMapping {
+    ///
+    /// # Description
+    ///
+    /// Creates a new anonymous memory mapping.
+    ///
+    /// # Parameters
+    ///
+    /// * `size` - Size of the mapping (in bytes). Must be greater than zero.
+    /// * `noreserve` - If `true`, do not reserve swap space for the mapping (`MAP_NORESERVE`).
+    ///
+    /// # Returns
+    ///
+    /// On success, returns an object representing the anonymous mapping. On failure, returns an
+    /// error.
+    ///
+    pub fn new(size: usize, noreserve: bool) -> Result<Self> {
+        trace!("AnonymousMapping::new(): size={size}, noreserve={noreserve}");
+
+        if size == 0 {
+            let reason: &str = "cannot create zero-sized anonymous mapping";
+            error!("AnonymousMapping::new(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        let mut flags: c_int = ::libc::MAP_ANONYMOUS | ::libc::MAP_PRIVATE;
+        if noreserve {
+            flags |= ::libc::MAP_NORESERVE;
+        }
+
+        let ptr: *mut ::libc::c_void = unsafe {
+            ::libc::mmap(
+                ptr::null_mut(),
+                size,
+                ::libc::PROT_READ | ::libc::PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == ::libc::MAP_FAILED {
+            let reason: String = format!(
+                "failed to create anonymous mapping (error={})",
+                ::std::io::Error::last_os_error()
+            );
+            error!("AnonymousMapping::new(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        Ok(Self { ptr, size })
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns a mutable pointer to the mapped memory region.
+    ///
+    /// # Returns
+    ///
+    /// A mutable pointer to the mapped memory region.
+    ///
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr.cast::<u8>()
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the size of the mapping (in bytes).
+    ///
+    /// # Returns
+    ///
+    /// The size of the mapping (in bytes).
+    ///
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the mapping contents as an immutable byte slice.
+    ///
+    /// # Returns
+    ///
+    /// An immutable byte slice covering the entire mapping.
+    ///
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: The mapping is valid for `self.size` bytes for the lifetime of `self`.
+        unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.size) }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the mapping contents as a mutable byte slice.
+    ///
+    /// # Returns
+    ///
+    /// A mutable byte slice covering the entire mapping.
+    ///
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: The mapping is valid for `self.size` bytes for the lifetime of `self`.
+        unsafe { slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.size) }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Replaces the entire mapping with a file-backed read-write mapping using `MAP_FIXED`.
+    /// Only the backing store changes; the pointer and size remain the same.
+    ///
+    /// # Parameters
+    ///
+    /// * `fd` - File descriptor of the backing file.
+    /// * `file_offset` - Byte offset into the file where the mapping begins (must be
+    ///   page-aligned).
+    ///
+    /// # Returns
+    ///
+    /// On success, returns empty. On failure, returns an error.
+    ///
+    pub fn remap_file(&self, fd: RawFd, file_offset: ::libc::off_t) -> Result<()> {
+        self.remap_file_at(0, self.size, fd, file_offset)
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Replaces a sub-region of the mapping with a file-backed read-write mapping using
+    /// `MAP_FIXED`. The region `[start, start + len)` must lie within the mapping bounds.
+    ///
+    /// # Parameters
+    ///
+    /// * `start` - Byte offset from the start of the mapping (must be page-aligned).
+    /// * `len` - Size of the region to remap (in bytes).
+    /// * `fd` - File descriptor of the backing file.
+    /// * `file_offset` - Byte offset into the file where the mapping begins (must be
+    ///   page-aligned).
+    ///
+    /// # Returns
+    ///
+    /// On success, returns empty. On failure, returns an error.
+    ///
+    pub fn remap_file_at(
+        &self,
+        start: usize,
+        len: usize,
+        fd: RawFd,
+        file_offset: ::libc::off_t,
+    ) -> Result<()> {
+        trace!(
+            "AnonymousMapping::remap_file_at(): start={start:#x}, len={len:#x}, fd={fd}, \
+             file_offset={file_offset}"
+        );
+
+        if len == 0 {
+            let reason: &str = "cannot remap zero-sized region";
+            error!("AnonymousMapping::remap_file_at(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        if start.checked_add(len).is_none_or(|end| end > self.size) {
+            let reason: String = format!(
+                "remap region [{start:#x}, {:#x}) exceeds mapping bounds (size={:#x})",
+                start.saturating_add(len),
+                self.size
+            );
+            error!("AnonymousMapping::remap_file_at(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        // SAFETY: `start` has been bounds-checked, so `self.ptr + start` stays within the mapping.
+        let addr: *mut u8 = unsafe { self.ptr.cast::<u8>().add(start) };
+        let result: *mut u8 = unsafe {
+            ::libc::mmap(
+                addr.cast::<::libc::c_void>(),
+                len,
+                ::libc::PROT_READ | ::libc::PROT_WRITE,
+                ::libc::MAP_PRIVATE | ::libc::MAP_FIXED,
+                fd,
+                file_offset,
+            )
+            .cast::<u8>()
+        };
+
+        if result == ::libc::MAP_FAILED.cast::<u8>() {
+            let reason: String = format!(
+                "failed to remap region as file-backed at {:?} (error={})",
+                addr,
+                ::std::io::Error::last_os_error()
+            );
+            error!("AnonymousMapping::remap_file_at(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        debug_assert_eq!(result, addr, "MAP_FIXED should return the exact requested address");
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Issues an `madvise` hint for a sub-region of the mapping.
+    ///
+    /// # Parameters
+    ///
+    /// * `start` - Byte offset from the start of the mapping (must be page-aligned).
+    /// * `len` - Size of the region in bytes.
+    /// * `advice` - madvise advice constant (e.g., `MADV_SEQUENTIAL`, `MADV_WILLNEED`).
+    ///
+    /// # Returns
+    ///
+    /// On success, returns empty. On failure, returns an error.
+    ///
+    pub fn madvise_at(&self, start: usize, len: usize, advice: i32) -> Result<()> {
+        trace!("AnonymousMapping::madvise_at(): start={start:#x}, len={len:#x}, advice={advice}");
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        if !start.is_multiple_of(page_size()) {
+            let reason: String = format!(
+                "start offset {start:#x} is not page-aligned (page_size={:#x})",
+                page_size()
+            );
+            error!("AnonymousMapping::madvise_at(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        if start.checked_add(len).is_none_or(|end| end > self.size) {
+            let reason: String = format!(
+                "madvise region [{start:#x}, {:#x}) exceeds mapping bounds (size={:#x})",
+                start.saturating_add(len),
+                self.size
+            );
+            error!("AnonymousMapping::madvise_at(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        // SAFETY: `start` has been bounds-checked, so `self.ptr + start` stays within the mapping.
+        let addr: *mut ::libc::c_void = unsafe { self.ptr.cast::<u8>().add(start).cast() };
+        let ret: i32 = unsafe { ::libc::madvise(addr, len, advice) };
+        if ret != 0 {
+            let reason: String = format!(
+                "madvise failed at {addr:?} (start={start:#x}, len={len:#x}, advice={advice}, \
+                 error={})",
+                ::std::io::Error::last_os_error()
+            );
+            error!("AnonymousMapping::madvise_at(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        Ok(())
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Replaces the entire mapping with a fresh anonymous read-write mapping using `MAP_FIXED`.
+    /// This is useful for restoring a neutral memory region after a failed file-backed remap.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns empty. On failure, returns an error.
+    ///
+    pub fn remap_anonymous(&self) -> Result<()> {
+        trace!("AnonymousMapping::remap_anonymous(): size={:#x}", self.size);
+
+        let result: *mut u8 = unsafe {
+            ::libc::mmap(
+                self.ptr,
+                self.size,
+                ::libc::PROT_READ | ::libc::PROT_WRITE,
+                ::libc::MAP_PRIVATE | ::libc::MAP_ANONYMOUS | ::libc::MAP_FIXED,
+                -1,
+                0,
+            )
+            .cast::<u8>()
+        };
+
+        if result == ::libc::MAP_FAILED.cast::<u8>() {
+            let reason: String = format!(
+                "failed to restore anonymous mapping at {:?} (error={})",
+                self.ptr,
+                ::std::io::Error::last_os_error()
+            );
+            error!("AnonymousMapping::remap_anonymous(): {reason}");
+            anyhow::bail!(reason);
+        }
+
+        debug_assert_eq!(
+            result,
+            self.ptr.cast::<u8>(),
+            "MAP_FIXED should return the exact requested address"
+        );
+
+        Ok(())
+    }
+}
+
+impl Drop for AnonymousMapping {
+    fn drop(&mut self) {
+        trace!("drop(): {self:?}");
+        unsafe {
+            if ::libc::munmap(self.ptr, self.size) < 0 {
+                let errno: c_int = *::libc::__errno_location();
+                warn!("drop(): failed to unmap anonymous region (errno={errno}, self={self:?})");
+            }
+        }
+    }
+}
+
+impl FileMapping {
+    ///
+    /// # Description
+    ///
+    /// Maps a file into memory.
+    ///
+    /// # Parameters
+    ///
+    /// * `filename` - Name of the file to be mapped.
+    ///
+    /// # Return Value
+    ///
+    /// On success, this function returns an object representing the memory-mapped file. On failure,
+    /// an error object that describes the error is returned instead.
+    ///
+    pub fn mmap(filename: &str) -> Result<Self> {
+        trace!("mmap(): filename={filename}");
+
+        // Open the file.
+        let fd: i32 = unsafe {
+            let filename: CString = CString::new(filename)?;
+            let filename: &[u8] = filename.as_bytes_with_nul();
+            ::libc::open(filename.as_ptr().cast::<c_char>(), ::libc::O_RDONLY)
+        };
+
+        // Check if we failed to open the file.
+        if fd < 0 {
+            let errno: c_int = unsafe { *::libc::__errno_location() };
+            let reason: String = format!("failed to open file (errno={errno})");
+            error!("mmap(): {reason} (filename={filename})");
+            anyhow::bail!(reason);
+        }
+
+        // Get file size.
+        let size: usize = unsafe {
+            let mut stat: ::libc::stat = mem::zeroed();
+            let last_errno: c_int = *::libc::__errno_location();
+            if ::libc::fstat(fd, &mut stat) < 0 {
+                if ::libc::close(fd) < 0 {
+                    let errno: c_int = *::libc::__errno_location();
+                    warn!("mmap(): failed to close file (errno={errno}, filename={filename})");
+                    // Don't bail to report the original error.
+                }
+                let reason: String = format!("failed to get file size (errno={last_errno})");
+                error!("mmap(): {reason} (filename={filename})");
+                anyhow::bail!(reason);
+            }
+
+            // Convert file size to usize.
+            match usize::try_from(stat.st_size) {
+                Ok(size) => size,
+                Err(_error) => {
+                    if ::libc::close(fd) < 0 {
+                        let errno: c_int = *::libc::__errno_location();
+                        warn!("mmap(): failed to close file (errno={errno}, filename={filename})");
+                        // Don't bail to report the original error.
+                    }
+                    let reason: String = format!("file is too large (size={})", stat.st_size);
+                    error!("mmap(): {reason} (filename={filename})");
+                    anyhow::bail!(reason);
+                },
+            }
+        };
+
+        // Map the file.
+        let ptr: *mut std::ffi::c_void = unsafe {
+            ::libc::mmap(ptr::null_mut(), size, ::libc::PROT_READ, ::libc::MAP_PRIVATE, fd, 0)
+        };
+
+        // Check if we failed to map the file.
+        if std::ptr::eq(ptr, ::libc::MAP_FAILED) {
+            let last_errno: c_int = unsafe { *::libc::__errno_location() };
+            unsafe {
+                if ::libc::close(fd) < 0 {
+                    let errno: c_int = *::libc::__errno_location();
+                    warn!("mmap(): failed to close file (errno={errno}, filename={filename})");
+                    // Don't bail to report the original error.
+                }
+            }
+            let reason: String = format!("failed to map file (errno={last_errno})");
+            error!("mmap(): {reason} (filename={filename})");
+            anyhow::bail!(reason);
+        }
+
+        Ok(Self { fd, size, ptr })
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns a pointer to the memory-mapped file.
+    ///
+    /// # Return Value
+    ///
+    /// A pointer to the memory-mapped file.
+    ///
+    pub fn ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the size of the memory-mapped file (in bytes).
+    ///
+    /// # Return Value
+    ///
+    /// The size of the memory-mapped file (in bytes).
+    ///
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Returns the mapped file contents as an immutable byte slice.
+    ///
+    /// # Returns
+    ///
+    /// An immutable byte slice covering the entire mapped file.
+    ///
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: The mapping is valid for `self.size` bytes for the lifetime of `self`.
+        unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.size) }
+    }
+}
+
+impl Drop for FileMapping {
+    fn drop(&mut self) {
+        trace!("drop(): {self:?}");
+        unsafe {
+            // Attempt to unmap file and check for errors.
+            if ::libc::munmap(self.ptr, self.size) < 0 {
+                let errno: c_int = *::libc::__errno_location();
+                warn!("drop(): failed to unmap file (errno={errno}, self={self:?})");
+                // Don't bail to attempt to close the file.
+            }
+            // Attempt to close file and check for errors.
+            if ::libc::close(self.fd) < 0 {
+                let errno: c_int = *::libc::__errno_location();
+                warn!("drop(): failed to close file (errno={errno}, self={self:?})");
+                // Don't bail to report the original error.
+            }
+        }
+    }
+}
+
+//==================================================================================================
+// Helper Functions
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Returns the system page size (cached after the first call).
+///
+/// # Returns
+///
+/// The system page size (in bytes).
+///
+fn page_size() -> usize {
+    static PAGE_SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is always safe to call and returns a positive value.
+        #[allow(clippy::cast_possible_truncation)]
+        let size: usize = unsafe { ::libc::sysconf(::libc::_SC_PAGESIZE) as usize };
+        size
+    });
+    *PAGE_SIZE
+}
+
+//==================================================================================================
+// IKC Stdout Sink
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Hands guest IKC (application/stdout) frames to the asynchronous I/O consumer over a bounded
+/// channel.
+///
+/// On Linux/KVM the frame is sent directly on the bounded channel: a full channel applies
+/// back-pressure by blocking the caller, as before. The KVM backend does not hold a partition-wide
+/// lock across the guest I/O exit, so this blocking does not freeze the guest (contrast with the
+/// Windows/WHP path; see issue #2603 and the Windows `IkcStdoutSink`).
+///
+pub struct IkcStdoutSink {
+    /// Bounded channel used to forward IKC frames to the asynchronous I/O consumer.
+    queue: Sender<IkcFrame>,
+}
+
+impl IkcStdoutSink {
+    ///
+    /// # Description
+    ///
+    /// Builds a sink around the bounded `queue`.
+    ///
+    /// # Parameters
+    ///
+    /// - `queue`: Bounded channel used to forward IKC frames to the asynchronous I/O consumer.
+    ///
+    /// # Returns
+    ///
+    /// A new [`IkcStdoutSink`].
+    ///
+    pub fn new(queue: Sender<IkcFrame>) -> Self {
+        Self { queue }
+    }
+
+    ///
+    /// # Description
+    ///
+    /// Forwards a single IKC frame to the consumer, blocking the caller while the bounded channel
+    /// is full (back-pressure).
+    ///
+    /// # Parameters
+    ///
+    /// - `frame`: IKC frame emitted by the guest.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` once the frame has been accepted, or an error if the consumer has gone away.
+    ///
+    pub fn send(&self, frame: IkcFrame) -> Result<()> {
+        self.queue
+            .blocking_send(frame)
+            .map_err(|e| ::anyhow::anyhow!("channel closed: {e}"))
+    }
+}
+
+//==================================================================================================
+// Tests
+//==================================================================================================
+
+#[cfg(test)]
+mod tests;

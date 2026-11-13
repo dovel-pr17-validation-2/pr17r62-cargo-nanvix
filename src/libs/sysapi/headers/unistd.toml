@@ -1,0 +1,479 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+#
+# C header specification for unistd.h.
+
+file = "unistd.h"
+brief = "Standard symbolic constants and types."
+description = '''
+Declares miscellaneous standard constants and the core POSIX process and I/O
+interfaces. Constants mirror the Rust definitions in the sysapi crate
+(unistd.rs); prototypes are generated from the syscall crate.'''
+includes = ["stddef.h", "sys/types.h"]
+guard = "_NANVIX_UNISTD_H"
+scan_crates = ["syscall"]
+content_order = [
+    "rust_constants:abi",
+    "raw:0",
+    "raw:1",
+    "section:0",
+    "raw:2",
+    "raw:3",
+    "section:1",
+    "section:2",
+]
+
+[[rust_constants]]
+path = "unistd::STDIN_FILENO"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::STDOUT_FILENO"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::STDERR_FILENO"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::file_seek::SEEK_SET"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::file_seek::SEEK_CUR"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::file_seek::SEEK_END"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_ARG_MAX"
+c_name = "_SC_ARG_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_CHILD_MAX"
+c_name = "_SC_CHILD_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_CLK_TCK"
+c_name = "_SC_CLK_TCK"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_NGROUPS_MAX"
+c_name = "_SC_NGROUPS_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_OPEN_MAX"
+c_name = "_SC_OPEN_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_VERSION"
+c_name = "_SC_VERSION"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_PAGESIZE"
+c_name = "_SC_PAGESIZE"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_PAGE_SIZE"
+c_name = "_SC_PAGE_SIZE"
+c_value = "8"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_NPROCESSORS_CONF"
+c_name = "_SC_NPROCESSORS_CONF"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_NPROCESSORS_ONLN"
+c_name = "_SC_NPROCESSORS_ONLN"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_PHYS_PAGES"
+c_name = "_SC_PHYS_PAGES"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_AVPHYS_PAGES"
+c_name = "_SC_AVPHYS_PAGES"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_LINK_MAX"
+c_name = "_PC_LINK_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_MAX_CANON"
+c_name = "_PC_MAX_CANON"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_MAX_INPUT"
+c_name = "_PC_MAX_INPUT"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_NAME_MAX"
+c_name = "_PC_NAME_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_PATH_MAX"
+c_name = "_PC_PATH_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_PIPE_BUF"
+c_name = "_PC_PIPE_BUF"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_CHOWN_RESTRICTED"
+c_name = "_PC_CHOWN_RESTRICTED"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_NO_TRUNC"
+c_name = "_PC_NO_TRUNC"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_VDISABLE"
+c_name = "_PC_VDISABLE"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_SYNC_IO"
+c_name = "_PC_SYNC_IO"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_ASYNC_IO"
+c_name = "_PC_ASYNC_IO"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_PRIO_IO"
+c_name = "_PC_PRIO_IO"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_FILESIZEBITS"
+c_name = "_PC_FILESIZEBITS"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_ALLOC_SIZE_MIN"
+c_name = "_PC_ALLOC_SIZE_MIN"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_REC_INCR_XFER_SIZE"
+c_name = "_PC_REC_INCR_XFER_SIZE"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_REC_MAX_XFER_SIZE"
+c_name = "_PC_REC_MAX_XFER_SIZE"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_REC_MIN_XFER_SIZE"
+c_name = "_PC_REC_MIN_XFER_SIZE"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_REC_XFER_ALIGN"
+c_name = "_PC_REC_XFER_ALIGN"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_SYMLINK_MAX"
+c_name = "_PC_SYMLINK_MAX"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::pathconf_names::PC_2_SYMLINKS"
+c_name = "_PC_2_SYMLINKS"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::access_mode::F_OK"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::access_mode::X_OK"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::access_mode::W_OK"
+group = "abi"
+emit = false
+
+[[rust_constants]]
+path = "unistd::access_mode::R_OK"
+group = "abi"
+emit = false
+
+# Alias dependency for _SC_PAGE_SIZE.
+[[rust_constants]]
+path = "unistd::sysconf_names::SC_PAGESIZE"
+c_name = "_SC_PAGESIZE"
+emit = false
+
+[[raw_sections]]
+title = "Constants"
+c_only_reason = "POSIX feature-test macros require conditional C preprocessor guards."
+text = '''
+/* POSIX feature-test macros. */
+#ifndef _POSIX_VERSION
+#define _POSIX_VERSION 200809L
+#endif
+#ifndef _POSIX_THREADS
+#define _POSIX_THREADS 200809L
+#endif
+#ifndef _POSIX_TIMERS
+#define _POSIX_TIMERS 200809L
+#endif
+#ifndef _POSIX_MONOTONIC_CLOCK
+#define _POSIX_MONOTONIC_CLOCK 200809L
+#endif
+
+#define STDIN_FILENO 0 /**< File descriptor of standard input. */
+#define STDOUT_FILENO 1 /**< File descriptor of standard output. */
+#define STDERR_FILENO 2 /**< File descriptor of standard error. */
+#ifndef SEEK_SET
+#define SEEK_SET 0 /**< Seek relative to start-of-file. */
+#endif
+
+#ifndef SEEK_CUR
+#define SEEK_CUR 1 /**< Seek relative to current position. */
+#endif
+
+#ifndef SEEK_END
+#define SEEK_END 2 /**< Seek relative to end-of-file. */
+#endif
+
+#define _SC_ARG_MAX 0 /**< Maximum length of arguments to exec(). */
+#define _SC_CHILD_MAX 1 /**< Maximum number of processes per user. */
+#define _SC_CLK_TCK 2 /**< Number of clock ticks per second. */
+#define _SC_NGROUPS_MAX 3 /**< Maximum number of supplementary group IDs. */
+#define _SC_OPEN_MAX 4 /**< Maximum number of open files per process. */
+#define _SC_VERSION 7 /**< POSIX.1 version. */
+#define _SC_PAGESIZE 8 /**< Size of a page in bytes. */
+#define _SC_PAGE_SIZE 8 /**< Size of a page in bytes (alias of _SC_PAGESIZE). */
+#define _SC_NPROCESSORS_CONF 9 /**< Number of configured processors. */
+#define _SC_NPROCESSORS_ONLN 10 /**< Number of online processors. */
+#define _SC_PHYS_PAGES 11 /**< Total number of physical pages. */
+#define _SC_AVPHYS_PAGES 12 /**< Number of available physical pages. */
+
+/* pathconf()/fpathconf() name selectors. */
+#define _PC_LINK_MAX 0 /**< Maximum number of links to a file. */
+#define _PC_MAX_CANON 1 /**< Maximum bytes in a terminal canonical input line. */
+#define _PC_MAX_INPUT 2 /**< Maximum bytes in a terminal input queue. */
+#define _PC_NAME_MAX 3 /**< Maximum length of a filename component. */
+#define _PC_PATH_MAX 4 /**< Maximum length of a relative pathname. */
+#define _PC_PIPE_BUF 5 /**< Maximum atomic write size to a pipe. */
+#define _PC_CHOWN_RESTRICTED 6 /**< Whether chown() is restricted. */
+#define _PC_NO_TRUNC 7 /**< Whether over-long pathname components error. */
+#define _PC_VDISABLE 8 /**< Terminal special-character disable value. */
+#define _PC_SYNC_IO 9 /**< Whether synchronized I/O is supported. */
+#define _PC_ASYNC_IO 10 /**< Whether asynchronous I/O is supported. */
+#define _PC_PRIO_IO 11 /**< Whether prioritized I/O is supported. */
+#define _PC_FILESIZEBITS 12 /**< Number of bits to represent a file's size. */
+#define _PC_ALLOC_SIZE_MIN 13 /**< Minimum allocation unit of a file. */
+#define _PC_REC_INCR_XFER_SIZE 14 /**< Recommended transfer size increment. */
+#define _PC_REC_MAX_XFER_SIZE 15 /**< Maximum recommended transfer size. */
+#define _PC_REC_MIN_XFER_SIZE 16 /**< Minimum recommended transfer size. */
+#define _PC_REC_XFER_ALIGN 17 /**< Recommended transfer buffer alignment. */
+#define _PC_SYMLINK_MAX 18 /**< Maximum length of a symbolic-link target. */
+#define _PC_2_SYMLINKS 19 /**< Whether the file system supports symbolic links. */'''
+
+[[raw_sections]]
+title = "File and Process Operations"
+text = '''
+extern ssize_t read(int fd, void *buffer, size_t count);
+extern ssize_t write(int fd, const void *buffer, size_t count);
+extern int close(int fd);
+extern void _exit(int status) __attribute__((__noreturn__));
+extern int pipe(int pipefd[2]);
+extern int dup(int oldfd);
+extern int dup2(int oldfd, int newfd);
+extern pid_t fork(void);
+extern int execve(const char *path, char *const argv[], char *const envp[]);
+extern int execvp(const char *file, char *const argv[]);
+extern int execv(const char *path, char *const argv[]);
+extern int execl(const char *path, const char *arg, ...);
+extern int execlp(const char *file, const char *arg, ...);
+extern int execle(const char *path, const char *arg, ...);
+extern pid_t getppid(void);
+extern int faccessat(int dirfd, const char *pathname, int mode, int flags);
+extern int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags);
+extern int lchown(const char *pathname, uid_t owner, gid_t group);
+extern int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags);
+extern int symlinkat(const char *target, int newdirfd, const char *linkpath);
+extern ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz);
+extern int truncate(const char *path, off_t length);
+extern long fpathconf(int fd, int name);
+extern long pathconf(const char *path, int name);
+
+extern char **environ;
+extern off_t lseek(int fd, off_t offset, int whence);
+extern int unlink(const char *path);
+extern int link(const char *oldpath, const char *newpath);
+extern int chroot(const char *path);
+extern int rmdir(const char *path);
+extern long sysconf(int name);'''
+
+[[raw_sections]]
+title = "File System Operations"
+text = '''
+extern ssize_t pread(int fd, void *buffer, size_t count, off_t offset);
+extern ssize_t pwrite(int fd, const void *buffer, size_t count, off_t offset);
+extern int ftruncate(int fd, off_t length);
+extern int fsync(int fd);
+extern int fdatasync(int fd);
+extern char *getcwd(char *buf, size_t size);
+extern int chdir(const char *path);
+extern int fchdir(int fd);
+
+/* access() mode bits. */
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+extern int access(const char *path, int amode);
+extern unsigned int sleep(unsigned int seconds);
+extern unsigned int alarm(unsigned int seconds);
+extern int usleep(unsigned int usec);
+extern int unlinkat(int dirfd, const char *pathname, int flags);
+extern int isatty(int fd);
+extern ssize_t readlink(const char *path, char *buf, size_t bufsize);
+extern int getentropy(void *buffer, size_t length);
+extern int symlink(const char *target, const char *linkpath);'''
+
+[[raw_sections]]
+title = "Command-Line Option Parsing State"
+text = '''
+extern char *optarg;
+extern int optind;
+extern int opterr;
+extern int optopt;'''
+
+[[sections]]
+title = "User and Group Identification"
+functions = [
+    "getpid",
+    "getuid",
+    "geteuid",
+    "getgid",
+    "getegid",
+    "setuid",
+    "seteuid",
+    "setgid",
+    "setegid",
+    "setresuid",
+    "setresgid",
+    "setgroups",
+    "gethostname",
+    "chown",
+    "fchown",
+]
+
+[[sections]]
+title = "Command-Line Option Parsing"
+functions = ["getopt"]
+
+[[sections]]
+title = "Process, Session, and System Operations"
+functions = [
+    "setsid",
+    "getsid",
+    "setpgid",
+    "setpgrp",
+    "getpgid",
+    "getpgrp",
+    "tcsetpgrp",
+    "tcgetpgrp",
+    "nice",
+    "sethostname",
+    "vfork",
+    "sync",
+    "syncfs",
+    "getgroups",
+    "gethostid",
+    "getlogin_r",
+    "ttyname_r",
+    "getpagesize",
+]
+
+[overrides]
+getopt = '''
+extern int getopt(int argc, char *const argv[], const char *optstring);'''
+setpgid = '''
+extern int setpgid(pid_t pid, pid_t pgid);'''
+setpgrp = '''
+extern int setpgrp(void);'''
+getpgid = '''
+extern pid_t getpgid(pid_t pid);'''
+getpgrp = '''
+extern pid_t getpgrp(void);'''
+tcsetpgrp = '''
+extern int tcsetpgrp(int fd, pid_t pgrp);'''
+tcgetpgrp = '''
+extern pid_t tcgetpgrp(int fd);'''
+nice = '''
+extern int nice(int inc);'''
+sethostname = '''
+extern int sethostname(const char *name, size_t len);'''

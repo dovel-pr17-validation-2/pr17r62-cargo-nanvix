@@ -1,0 +1,295 @@
+// Copyright(c) The Maintainers of Nanvix.
+// Licensed under the MIT License.
+
+//! Nanvix Daemon (nanvixd) entry point.
+
+//==================================================================================================
+// Configuration
+//==================================================================================================
+
+#![deny(clippy::all)]
+#![forbid(clippy::unwrap_used)]
+#![cfg_attr(not(test), forbid(clippy::expect_used))]
+
+//==================================================================================================
+// Imports
+//==================================================================================================
+
+use ::anyhow::Result;
+use ::log::{
+    error,
+    info,
+    warn,
+};
+use ::nanvix::{
+    config::system::DEFAULT_MACHINE_NAME,
+    http::HttpServer,
+    hwloc,
+    log::LogDestination,
+    sandbox_config::StandaloneConfig,
+    terminal::Terminal,
+};
+use ::nanvixd::args::Args;
+use ::std::{
+    path::Path,
+    process::ExitCode,
+    time::Duration,
+};
+use ::tokio::{
+    fs,
+    runtime::Runtime,
+};
+
+//==================================================================================================
+// Constants
+//==================================================================================================
+
+/// Default log-level (overridden by RUST_LOG environment variable if set).
+const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Maximum exit code value that can be represented as a process exit code.
+const MAX_EXIT_CODE: i32 = 255;
+
+/// Binary name for Kernel.
+const KERNEL_BINARY_NAME: &str = "kernel.elf";
+
+/// Maximum time to wait on exit for work that is still running on the Tokio runtime.
+///
+/// When the daemon shuts down while a VM is running, it tears the VM down, but the vCPU thread of
+/// the VM, which runs on the blocking thread pool of the runtime, keeps running the guest until
+/// the process exits. Dropping the runtime would wait for that thread forever.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+//==================================================================================================
+// Standalone Functions
+//==================================================================================================
+
+///
+/// # Description
+///
+/// Entry point for the Nanvix Daemon.
+///
+/// # Returns
+///
+/// On success, returns the workload exit code in interactive mode or success in HTTP mode.
+///
+pub fn main() -> Result<ExitCode> {
+    let args: Args = Args::parse(
+        ::std::env::args()
+            .filter(|arg| !arg.trim().is_empty())
+            .collect(),
+    )?;
+
+    ::nanvix::log::init_with_destination(log_destination(&args), DEFAULT_LOG_LEVEL);
+
+    print_startup_info(&args);
+
+    // Pin the main thread before the runtime creates its threads, so that they inherit its CPU
+    // affinity.
+    pin_to_cpu_mask(&args)?;
+
+    let runtime: Runtime = ::tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ::anyhow::anyhow!("failed to build tokio runtime: {error}"))?;
+    let result: Result<ExitCode> = runtime.block_on(async_main(args));
+    // Bound the time spent waiting for leftover work, so that a VM that was torn down cannot keep
+    // the daemon alive. Work still running after the timeout ends when the process exits.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+///
+/// # Description
+///
+/// Asynchronous entry point for the Nanvix Daemon.
+///
+/// # Parameters
+///
+/// - `args`: Parsed command-line arguments.
+///
+async fn async_main(args: Args) -> Result<ExitCode> {
+    let kernel_binary_path: String = ensure_kernel_binary_available(&args).await?;
+    let config: StandaloneConfig = StandaloneConfig::new(
+        kernel_binary_path,
+        args.ramfs_filename().map(str::to_string),
+        args.console_file(),
+        args.snapshot_path().map(str::to_string),
+        args.mount_directory().map(str::to_string),
+        args.kernel_args().map(str::to_string),
+        args.networking_mode(),
+        args.host_filter(),
+        #[cfg(feature = "gdb")]
+        args.gdb_port(),
+        args.gateway_sockaddr().map(str::to_string),
+    );
+
+    if args.interactive_mode() {
+        let guest_binary_path: &str = match args.program_name() {
+            Some(path) => path,
+            None => {
+                let reason: &str = "no program name specified in interactive mode";
+                error!("{reason}");
+                anyhow::bail!(reason);
+            },
+        };
+        let guest_binary_args: String = args.program_args().join(" ");
+        let mut terminal: Terminal = Terminal::new(config);
+        let exit_code: i32 = terminal
+            .run(None, None, guest_binary_path, &guest_binary_args)
+            .await?;
+        let exit_code: u8 = if (0..=MAX_EXIT_CODE).contains(&exit_code) {
+            exit_code as u8
+        } else {
+            MAX_EXIT_CODE as u8
+        };
+        Ok(ExitCode::from(exit_code))
+    } else {
+        let http_sockaddr: &str = match args.http_sockaddr() {
+            Some(sockaddr) => sockaddr,
+            None => {
+                let reason: &str = "no HTTP socket address specified in HTTP mode";
+                error!("{reason}");
+                anyhow::bail!(reason);
+            },
+        };
+        let mut http_server: HttpServer = HttpServer::new(http_sockaddr, config);
+        if let Err(error) = http_server.run().await {
+            error!("http server failed: {error}");
+            return Ok(ExitCode::FAILURE);
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+///
+/// # Description
+///
+/// Ensures that the kernel binary is available locally.
+///
+/// # Parameters
+///
+/// - `args`: Parsed command-line arguments.
+///
+/// # Returns
+///
+/// On success, returns the kernel binary path. On failure, returns an error.
+///
+async fn ensure_kernel_binary_available(args: &Args) -> Result<String> {
+    // Both components are UTF-8, so converting the joined path back to a string is lossless.
+    let kernel_binary_path: String = Path::new(args.binary_directory())
+        .join(KERNEL_BINARY_NAME)
+        .to_string_lossy()
+        .into_owned();
+    match fs::metadata(&kernel_binary_path).await {
+        Ok(_) => {
+            info!("using local binary {KERNEL_BINARY_NAME}: {kernel_binary_path}");
+            Ok(kernel_binary_path)
+        },
+        Err(error) => {
+            let reason: String = format!(
+                "kernel binary not available locally: {kernel_binary_path}: {error} (use {} to \
+                 set the directory containing Nanvix binaries)",
+                Args::OPT_BIN_DIRECTORY
+            );
+            error!("ensure_kernel_binary_available(): {reason}");
+            Err(::anyhow::anyhow!(reason))
+        },
+    }
+}
+
+///
+/// # Description
+///
+/// Pins the Nanvix Daemon to the CPUs of its CPU mask, if any.
+///
+/// This function pins the calling thread, so it must run on the main thread before the Nanvix
+/// Daemon creates other threads. These threads inherit the CPU affinity of the main thread, so
+/// every thread of the Nanvix Daemon, including those that run User VMs, runs on those CPUs. CPU
+/// pinning is not supported on non-Unix hosts, on which this function only warns that the CPU
+/// mask is ignored.
+///
+/// # Parameters
+///
+/// - `args`: Parsed command-line arguments.
+///
+/// # Returns
+///
+/// On success, returns empty. On failure, returns an error that describes why the Nanvix Daemon
+/// could not be pinned.
+///
+fn pin_to_cpu_mask(args: &Args) -> Result<()> {
+    let Some(cpu_mask) = args.cpu_mask() else {
+        return Ok(());
+    };
+    if cfg!(unix) {
+        hwloc::pin_main_thread(cpu_mask.to_string())?;
+        info!("pinned to CPUs {cpu_mask}");
+    } else {
+        warn!("CPU pinning is not supported on this platform, ignoring CPU mask {cpu_mask}");
+    }
+    Ok(())
+}
+
+///
+/// # Description
+///
+/// Returns the destination of the log records of the Nanvix Daemon.
+///
+/// # Parameters
+///
+/// - `args`: Parsed command-line arguments.
+///
+/// # Returns
+///
+/// Standard output if logs are routed to it (see [`Args::log_to_stdout()`]). Otherwise, a log file
+/// in the log directory.
+///
+fn log_destination(args: &Args) -> LogDestination {
+    if args.log_to_stdout() {
+        LogDestination::Stdout
+    } else {
+        LogDestination::File {
+            directory: args.log_directory().to_string(),
+            discriminator: None,
+        }
+    }
+}
+
+///
+/// # Description
+///
+/// Prints startup information for the Nanvix Daemon.
+///
+/// # Parameters
+///
+/// - `args`: Parsed command-line arguments.
+///
+fn print_startup_info(args: &Args) {
+    let operation_mode: &str = if args.interactive_mode() {
+        "interactive"
+    } else {
+        "http"
+    };
+    info!(
+        "nanvixd {}, standalone deployment, {} mode, machine {}",
+        env!("CARGO_PKG_VERSION"),
+        operation_mode,
+        DEFAULT_MACHINE_NAME
+    );
+
+    if let Some(config_path) = args.config_path() {
+        info!("configuration file: {config_path}");
+    }
+
+    if let Some(snapshot) = args.snapshot_path() {
+        info!("snapshot restore from: {snapshot}");
+    }
+}
+
+//==================================================================================================
+// Tests
+//==================================================================================================
+
+#[cfg(test)]
+mod tests;

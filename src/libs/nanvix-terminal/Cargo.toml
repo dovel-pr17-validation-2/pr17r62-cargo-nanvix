@@ -1,0 +1,30 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+[package]
+name = "nanvix-terminal"
+version.workspace = true
+license-file.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Terminal interface for Nanvix"
+homepage.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+nanvix-sandbox-config = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+uservm = { workspace = true }
+
+[features]
+default = ["microvm"]
+gdb = ["uservm/gdb", "nanvix-sandbox-config/gdb"]
+# Enables fine-grained time profiling.
+profile-time = ["uservm/profile-time"]
+microvm = ["uservm/microvm"]
+whp = ["uservm/whp"]
+
+[lints]
+workspace = true

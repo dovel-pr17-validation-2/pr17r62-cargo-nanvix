@@ -1,0 +1,58 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+# Build artifacts
+target/
+toolchain/
+sysroot*/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+
+# Archives and images
+*.tar
+*.tar.gz
+*.tar.bz2
+*.iso
+
+# Version control
+.git/
+.github/
+.githooks/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+temp/
+
+# Runtime directories (created during execution or Docker builds)
+home/
+mnt/
+
+# Documentation
+doc/
+
+# Test files
+test/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Cache files
+.z.cache
+__pycache__/
+*.pyc
+.cargo/

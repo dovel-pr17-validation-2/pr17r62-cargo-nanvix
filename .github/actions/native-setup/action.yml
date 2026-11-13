@@ -1,0 +1,78 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Native Setup"
+description: "Set up native build environment for CI jobs (container-aware)"
+
+inputs:
+  components:
+    description: "Space-separated list of additional Rust components to install
+      (e.g., 'rustfmt clippy')"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Detect CI Container"
+      id: detect-container
+      shell: bash
+      run: |
+        if [ -f /etc/nanvix-ci-container ]; then
+          echo "in-container=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "in-container=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # actions/checkout sets safe.directory via a temporary HOME override that
+    # is invisible to later steps running inside the container.  Re-add it
+    # under the real HOME so git commands in ./z (and make) work correctly.
+    - name: "Mark Workspace Safe for Git"
+      if: steps.detect-container.outputs.in-container == 'true'
+      shell: bash
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    # When running outside the CI container, install system dependencies from
+    # scratch.  Inside the container these are already present.
+    - name: "Install Rust Toolchain"
+      shell: bash
+      env:
+        IN_CONTAINER: ${{ steps.detect-container.outputs.in-container }}
+      run: |
+        if [ "${IN_CONTAINER}" = "true" ]; then
+          # Container already has the toolchain; just ensure extra components.
+          for component in ${{ inputs.components }}; do
+            if ! rustup component add "${component}" 2>/dev/null; then
+              echo "error: failed to add Rust component '${component}' in CI container image." >&2
+              echo "       Ensure the component is preinstalled in the image or remove it from 'inputs.components'." >&2
+              exit 1
+            fi
+          done
+        else
+          # Bare runner — rust-toolchain file drives the install.
+          rustup show
+          for component in ${{ inputs.components }}; do
+            rustup component add "${component}"
+          done
+        fi
+
+    - name: "Install System Dependencies"
+      if: steps.detect-container.outputs.in-container != 'true'
+      shell: bash
+      run: ./z setup
+
+    - name: "Setup Python Environment"
+      shell: bash
+      env:
+        IN_CONTAINER: ${{ steps.detect-container.outputs.in-container }}
+      run: |
+        if [ "${IN_CONTAINER}" = "true" ]; then
+          # Container venv is at /opt/nanvix-venv; create a local symlink so
+          # scripts that activate .venv keep working.
+          if [ ! -d .venv ]; then
+            ln -s /opt/nanvix-venv .venv
+          fi
+        else
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet -r requirements.txt
+        fi

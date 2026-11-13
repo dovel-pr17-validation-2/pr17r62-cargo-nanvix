@@ -1,0 +1,212 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Pre-Check if Branch is Up-To-Date"
+
+# Reusable workflow that checks if the current ref branch is behind the repository's
+# default branch and that it contains no merge commits. The default branch is resolved
+# from the event context to support PRs and forks.
+
+on:
+  workflow_call:
+    outputs:
+      up_to_date:
+        description: "Whether the branch is up to date with the default branch (not
+          behind and no merge commits)."
+        value: ${{ jobs.precheck.outputs.up_to_date }}
+      behind_count:
+        description: "How many commits the branch is behind the default branch."
+        value: ${{ jobs.precheck.outputs.behind_count }}
+      default_branch:
+        description: "The default branch name resolved for the base repository."
+        value: ${{ jobs.precheck.outputs.default_branch }}
+      has_merge_commits:
+        description: "Whether the branch contains merge commits not present on the
+          default branch."
+        value: ${{ jobs.precheck.outputs.has_merge_commits }}
+      merge_commit_count:
+        description: "The number of merge commits on the branch that are not on the
+          default branch."
+        value: ${{ jobs.precheck.outputs.merge_commit_count }}
+
+jobs:
+  precheck:
+    name: "Compute Branch Divergence"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      up_to_date: ${{ steps.final_status.outputs.up_to_date }}
+      behind_count: ${{ steps.branch_status.outputs.behind_count }}
+      default_branch: ${{ steps.branch_status.outputs.default_branch }}
+      has_merge_commits: ${{ steps.merge_check.outputs.has_merge_commits }}
+      merge_commit_count: ${{ steps.merge_check.outputs.merge_commit_count }}
+    steps:
+      - name: "Checkout (full history; prefer PR head on PRs)"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name ||
+            github.repository }}
+
+      - name: "Determine if branch is behind default branch"
+        id: branch_status
+        shell: bash
+        env:
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name ||
+            github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref ||
+            github.event.repository.default_branch || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_BRANCH="${GITHUB_REF_NAME}"
+
+          # Resolve default branch from event base ref; fallback to remote metadata.
+          DEFAULT_BRANCH="${BASE_REF}"
+          if [ -z "${DEFAULT_BRANCH}" ] || [ "${DEFAULT_BRANCH}" = "refs/heads/" ]; then
+            DEFAULT_BRANCH=$(git remote show origin | awk '/HEAD branch:/ {print $NF}')
+          fi
+
+          if [ -z "${DEFAULT_BRANCH:-}" ]; then
+            echo "Could not determine default branch; marking up_to_date=true (non-blocking)." >&2
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=0" >> "$GITHUB_OUTPUT"
+            echo "default_branch=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${CURRENT_BRANCH}" = "${DEFAULT_BRANCH}" ]; then
+            echo "On default branch (${DEFAULT_BRANCH}); marking up_to_date=true." >&2
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=0" >> "$GITHUB_OUTPUT"
+            echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Ensure upstream (base repo) remote exists and fetch the default branch ref.
+          if ! git remote | grep -q '^upstream$'; then
+            git remote add upstream "https://github.com/${BASE_REPO}.git"
+          fi
+          git fetch --no-tags upstream "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/upstream/${DEFAULT_BRANCH}"
+
+          # Compute commits present in upstream/default but not in HEAD (behind count).
+          COUNTS=$(git rev-list --left-right --count "upstream/${DEFAULT_BRANCH}...HEAD" 2>/dev/null || true)
+          if [ -z "${COUNTS}" ]; then
+            # Fallback to origin default branch if upstream ref isn't available.
+            git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}" || true
+            COUNTS=$(git rev-list --left-right --count "origin/${DEFAULT_BRANCH}...HEAD" 2>/dev/null || echo "0 0")
+          fi
+
+          LEFT=$(echo "${COUNTS}" | awk '{print $1}')
+          RIGHT=$(echo "${COUNTS}" | awk '{print $2}')
+          BEHIND=${LEFT:-0}
+
+          if [ "${BEHIND}" -eq 0 ]; then
+            echo "Branch is not behind ${DEFAULT_BRANCH} (behind=${BEHIND})." >&2
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=${BEHIND}" >> "$GITHUB_OUTPUT"
+            echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Branch is behind ${DEFAULT_BRANCH} by ${BEHIND} commits." >&2
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "behind_count=${BEHIND}" >> "$GITHUB_OUTPUT"
+            echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Check for merge commits on branch"
+        id: merge_check
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ steps.branch_status.outputs.default_branch }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_BRANCH="${GITHUB_REF_NAME}"
+
+          # Skip check when default branch is unknown or we are on it.
+          if [ "${DEFAULT_BRANCH}" = "unknown" ] || [ "${CURRENT_BRANCH}" = "${DEFAULT_BRANCH}" ]; then
+            echo "has_merge_commits=false" >> "$GITHUB_OUTPUT"
+            echo "merge_commit_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Count merge commits reachable from HEAD but not from upstream/default branch.
+          MERGE_COUNT=$(git rev-list --merges --count "upstream/${DEFAULT_BRANCH}..HEAD" 2>/dev/null || true)
+          if [ -z "${MERGE_COUNT}" ]; then
+            # Fallback to origin default branch if upstream ref isn't available.
+            # Ensure we have the origin default branch locally before counting merge commits.
+            git fetch origin "${DEFAULT_BRANCH}"
+            MERGE_COUNT=$(git rev-list --merges --count "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null || echo "0")
+          fi
+
+          MERGE_COUNT=${MERGE_COUNT:-0}
+
+          if [ "${MERGE_COUNT}" -eq 0 ]; then
+            echo "Branch has no merge commits." >&2
+            echo "has_merge_commits=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Branch has ${MERGE_COUNT} merge commit(s)." >&2
+            echo "has_merge_commits=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "merge_commit_count=${MERGE_COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: "Determine final up-to-date status"
+        id: final_status
+        shell: bash
+        env:
+          BEHIND_COUNT: ${{ steps.branch_status.outputs.behind_count }}
+          MERGE_COUNT: ${{ steps.merge_check.outputs.merge_commit_count }}
+        run: |
+          set -euo pipefail
+
+          if [ "${BEHIND_COUNT}" -eq 0 ] && [ "${MERGE_COUNT}" -eq 0 ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Comment on PR when branch is behind or contains merge commits"
+        if: ${{ github.event_name == 'pull_request' &&
+          steps.final_status.outputs.up_to_date == 'false' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const number = context.payload.pull_request.number;
+            const defaultBranch = `${{ steps.branch_status.outputs.default_branch }}`;
+            const behind = parseInt(`${{ steps.branch_status.outputs.behind_count }}`, 10);
+            const mergeCount = parseInt(`${{ steps.merge_check.outputs.merge_commit_count }}`, 10);
+            const lines = [];
+            if (behind > 0) {
+              lines.push(
+                `⚠️ This branch is behind \`${defaultBranch}\` by ${behind} commit(s).`,
+                '',
+                'Please update your branch so CI can proceed:',
+                '```bash',
+                'git fetch origin',
+                `git rebase origin/${defaultBranch}`,
+                '```',
+              );
+            }
+            if (mergeCount > 0) {
+              lines.push(
+                `⚠️ This branch contains ${mergeCount} merge commit(s). Please rebase instead of merging:`,
+                '',
+                '```bash',
+                'git fetch origin',
+                `git rebase origin/${defaultBranch}`,
+                '```',
+              );
+            }
+            if (lines.length > 0) {
+              lines.push('After updating, re-run the workflows by pushing new commits.');
+            }
+            const body = lines.join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              body
+            });

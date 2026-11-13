@@ -1,0 +1,84 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: "Cleanup Dangling Resources"
+description: "Report and clean up resources that may have been left behind by previous runs or
+  crashes"
+
+inputs:
+  phase:
+    description: "Cleanup phase: 'pre' (before tests, waits for ports, fails on
+      timeout) or 'post' (after tests, informational only)"
+    required: true
+  port:
+    description: "Port number to check availability"
+    required: false
+    default: "9999"
+  wait-port-timeout:
+    description: "Timeout in seconds to wait for port to become available"
+    required: false
+    default: "70"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Cleanup Dangling Resources"
+      shell: bash
+      run: |
+        PHASE="${{ inputs.phase }}"
+        PORT="${{ inputs.port }}"
+        WAIT_PORT_TIMEOUT="${{ inputs.wait-port-timeout }}"
+        CLEANUP_SCRIPT="${GITHUB_WORKSPACE}/scripts/cleanup-nanvixd.sh"
+
+        # Ensure cleanup script exists and is executable.
+        if [[ ! -x "${CLEANUP_SCRIPT}" ]]; then
+          echo "ERROR: Cleanup script not found or not executable: ${CLEANUP_SCRIPT}"
+          exit 1
+        fi
+
+        # Report the gateway sockets that nanvixd leaked before cleaning them up. The report is a
+        # workflow annotation, and a section of the job summary, so that it shows up on the page
+        # of the workflow run, instead of being buried in the logs.
+        if [[ "${PHASE}" == "pre" ]]; then
+          LEAK_ORIGIN="left on this runner by a previous job"
+        else
+          LEAK_ORIGIN="left behind by this job"
+        fi
+        if LEAKED_SOCKETS="$("${CLEANUP_SCRIPT}" --list-sockets)"; then
+          if [[ -n "${LEAKED_SOCKETS}" ]]; then
+            mapfile -t LEAKED_SOCKET_LIST <<< "${LEAKED_SOCKETS}"
+            LEAK_SUMMARY="Found ${#LEAKED_SOCKET_LIST[@]} nanvixd gateway socket(s) ${LEAK_ORIGIN}"
+            echo "::warning title=Leaked nanvixd sockets::${LEAK_SUMMARY}: ${LEAKED_SOCKET_LIST[*]}"
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              {
+                echo "### :warning: Leaked nanvixd Gateway Sockets (${PHASE}-cleanup)"
+                echo
+                echo "${LEAK_SUMMARY}, which this step removes. nanvixd removes the gateway" \
+                  "socket of a VM whenever it tears the VM down, even when it is stopped by" \
+                  "SIGINT, SIGTERM, SIGHUP, or SIGQUIT, so a leaked socket means that nanvixd" \
+                  "was killed with SIGKILL, crashed, or was left running."
+                echo
+                for socket in "${LEAKED_SOCKET_LIST[@]}"; do
+                  echo "- \`${socket}\`"
+                done
+              } >> "${GITHUB_STEP_SUMMARY}"
+            fi
+          fi
+        else
+          echo "::warning title=Leaked nanvixd sockets::Failed to check for leaked gateway sockets."
+        fi
+
+        # Run full cleanup (kills processes, cleans sockets, temp dirs).
+        ${CLEANUP_SCRIPT} --all --verbose
+
+        # Port availability handling differs by phase.
+        if [[ "${PHASE}" == "pre" ]]; then
+          # Pre-cleanup: wait for port, fail if timeout exceeded.
+          "${CLEANUP_SCRIPT}" --wait-port "${PORT}" --wait-port-timeout "${WAIT_PORT_TIMEOUT}" --verbose
+        else
+          # Post-cleanup: informational check only.
+          echo "Post-cleanup: checking port ${PORT} status (informational only)..."
+          if ! "${CLEANUP_SCRIPT}" --wait-port "${PORT}" --wait-port-timeout 5 2>/dev/null; then
+            echo "Warning: Port ${PORT} is still in use. Next job may need to wait for TIME_WAIT."
+          fi
+        fi
